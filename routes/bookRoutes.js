@@ -6,8 +6,10 @@ const {
   addBook,
   getAllBooks,
   getBookById,
+  getTextAccessUrl,
   uploadTranslationDocument,
   uploadAudioFile,
+  assignUnclaimedVersion,
   assignToChecker,
   reassignAfterRejections,
   setSpocBlocker,
@@ -53,6 +55,7 @@ router.use(protect)
 
 // Admin only
 router.post('/', authorise('admin'), addBook)
+router.put('/:bookId/versions/:versionId/assign-unclaimed', authorise('admin', 'spoc'), assignUnclaimedVersion)
 router.put('/:bookId/versions/:versionId/assign', authorise('admin', 'spoc'), assignToChecker)
 router.put('/:bookId/versions/:versionId/reassign', authorise('admin', 'spoc'), reassignAfterRejections)
 router.put('/:bookId/versions/:versionId/blocker', authorise('spoc'), setSpocBlocker)
@@ -61,6 +64,7 @@ router.put('/:bookId/versions/:versionId/publish', authorise('admin'), publishBo
 // All logged in users
 router.get('/', getAllBooks)
 router.get('/my-assignments', getMyAssignedBooks)
+router.get('/:bookId/versions/:versionId/text-access-url', getTextAccessUrl)
 router.get('/:bookId', getBookById)
 
 // Status updates (manual)

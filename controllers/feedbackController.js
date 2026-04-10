@@ -175,8 +175,92 @@ const getFeedbackSummary = async (req, res) => {
   }
 }
 
+const getMyFeedbackFeed = async (req, res) => {
+  try {
+    if (req.user.role !== 'translator') {
+      return res.status(403).json({ message: 'Only translators can access personal feedback feed' })
+    }
+
+    const feedbackList = await Feedback.find({
+      language: req.user.language
+    })
+      .populate('reviewer', 'name email role language')
+      .sort({ createdAt: -1 })
+
+    const languageBooks = await Book.find({
+      'languageVersions.language': req.user.language
+    }).select('title languageVersions._id languageVersions.language languageVersions.feedback languageVersions.blockerNote languageVersions.updatedAt')
+
+    const uniqueBookIds = [...new Set(
+      feedbackList
+        .map((entry) => entry.book?.toString())
+        .filter(Boolean)
+    )]
+
+    const books = await Book.find({
+      _id: { $in: uniqueBookIds }
+    }).select('title')
+
+    const titleByBookId = new Map(
+      books.map((book) => [book._id.toString(), book.title])
+    )
+
+    const enriched = feedbackList.map((entry) => {
+      const bookId = entry.book?.toString() || ''
+
+      return {
+        ...entry.toObject(),
+        entryType: 'formal_feedback',
+        bookTitle: titleByBookId.get(bookId) || 'Unknown Book',
+        language: entry.language,
+        bookId: entry.book,
+        versionId: entry.versionId
+      }
+    })
+
+    const workflowNotes = []
+
+    languageBooks.forEach((book) => {
+      ;(book.languageVersions || []).forEach((version) => {
+        if (version.language !== req.user.language) return
+
+        const feedbackText = String(version.feedback || '').trim()
+        const blockerText = String(version.blockerNote || '').trim()
+        if (!feedbackText && !blockerText) return
+
+        const noteParts = []
+        if (feedbackText) noteParts.push(feedbackText)
+        if (blockerText) noteParts.push(`Blocker: ${blockerText}`)
+
+        workflowNotes.push({
+          _id: `workflow-${book._id.toString()}-${version._id.toString()}`,
+          entryType: 'workflow_note',
+          book: book._id,
+          bookId: book._id,
+          versionId: version._id,
+          bookTitle: book.title,
+          language: version.language,
+          rating: null,
+          text: noteParts.join(' | '),
+          reviewer: null,
+          createdAt: version.updatedAt || new Date(0)
+        })
+      })
+    })
+
+    const merged = [...enriched, ...workflowNotes].sort((a, b) => {
+      return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
+    })
+
+    return res.status(200).json(merged)
+  } catch (error) {
+    return res.status(500).json({ message: 'Server error', error: error.message })
+  }
+}
+
 module.exports = {
   submitFeedback,
   getFeedbackList,
-  getFeedbackSummary
+  getFeedbackSummary,
+  getMyFeedbackFeed
 }

@@ -27,11 +27,13 @@ Required:
 
 - `MONGO_URI`
 - `JWT_SECRET`
+- `SESSION_SECRET`
 
 Optional but recommended for email/notifications:
 
 - `EMAIL_USER`
 - `EMAIL_PASS`
+- `SUPPORT_CONTACT_EMAIL`
 
 Optional for frontend links in emails:
 
@@ -46,6 +48,17 @@ Optional for Google login:
 Optional workflow behavior:
 
 - `TRANSLATION_INVITE_LANGUAGES`
+- `PORT` (defaults to `5000`)
+- `CORS_ORIGINS` (comma-separated allowed origins)
+- `EXCEL_AUDIT_PATH` (local XLSX audit trail for translation/audio submissions)
+
+Optional for SPOC approval logs in Google Sheets:
+
+- `GOOGLE_SHEETS_ENABLED` (`true` by default)
+- `GOOGLE_SHEET_ID`
+- `GOOGLE_SHEET_NAME` (default `SPOC Approvals`)
+- `GOOGLE_SERVICE_ACCOUNT_EMAIL`
+- `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY` (single-line env var with `\\n` line breaks)
 
 ### 3) Run
 
@@ -86,6 +99,25 @@ All routes are mounted under `/api`.
 Daily follow-up job configured in `index.js`:
 
 - Cron: `0 9 * * *` (9:00 AM server time)
+- Claim assistance reminder cadence: every 2 days per active claim
+
+## Google Sheet Sync (SPOC approvals)
+
+When a SPOC gives final audio approval, the backend appends one row to Google Sheets with:
+
+- Hindi book name
+- Language name
+- Translated text and translated file links
+- Generated audio links
+- SPOC details (name, email, language, user ID)
+
+Setup steps:
+
+1. Create a Google Cloud service account and enable the Google Sheets API.
+2. Create a Google Sheet and note its Sheet ID from the URL.
+3. Share that Google Sheet with the service account email as **Editor**.
+4. Fill the Google Sheet env vars in `.env`.
+5. Restart the server.
 
 ## Auth & Access Model
 
@@ -106,7 +138,7 @@ Main roles in the system:
 
 ## Notes for Production Hardening
 
-1. Move session secret to a dedicated env var instead of reusing `JWT_SECRET`.
-2. Restrict CORS origins instead of open default.
+1. Configure `SESSION_SECRET` separately from `JWT_SECRET`.
+2. Set `CORS_ORIGINS` explicitly to trusted frontend domains.
 3. Add request validation for all mutation endpoints.
-4. Add API integration tests and role-based authorization tests.
+4. Expand API integration tests and role-based authorization tests.

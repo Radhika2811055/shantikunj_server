@@ -4,6 +4,8 @@ const User = require('../models/User')
 const sendMail = require('../config/mailer')
 const { createBulkNotifications } = require('../services/notificationService')
 
+const FOLLOW_UP_INTERVAL_DAYS = 2
+
 const CLAIM_ROLE_MAP = {
   translation: 'translator',
   checking: 'checker',
@@ -52,6 +54,8 @@ const resetVersionForExpiredClaim = (version, claimType) => {
 const sendFollowUps = async () => {
   try {
     console.log('Running follow-up job...')
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173'
+    const supportContactEmail = process.env.SUPPORT_CONTACT_EMAIL || process.env.EMAIL_USER || ''
 
     // Find all active claims
     const activeClaims = await Claim.find({ status: 'active' })
@@ -120,7 +124,7 @@ const sendFollowUps = async () => {
                     <strong>Task:</strong> ${STAGE_LABEL[claim.claimType]}
                   </div>
                   <p>Login and claim if you are available.</p>
-                  <a href="http://localhost:5173"
+                  <a href="${frontendUrl}"
                      style="background: #1D9E75; color: white; padding: 12px 24px;
                             text-decoration: none; border-radius: 6px; display: inline-block;">
                     Open LMS Dashboard
@@ -143,20 +147,20 @@ const sendFollowUps = async () => {
         continue
       }
 
-      // Check if 3 days have passed since last follow-up
+      // Check if reminder interval has passed since last follow-up.
       const lastFollowUp = claim.lastFollowUpSent
       const daysSinceFollowUp = lastFollowUp
         ? (now - new Date(lastFollowUp)) / (1000 * 60 * 60 * 24)
         : (now - new Date(claim.claimedAt)) / (1000 * 60 * 60 * 24)
 
-      if (daysSinceFollowUp >= 3) {
+      if (daysSinceFollowUp >= FOLLOW_UP_INTERVAL_DAYS) {
         const daysLeft = Math.ceil(
           (new Date(claim.deadline) - now) / (1000 * 60 * 60 * 24)
         )
 
-        await sendMail({
+        const followUpResult = await sendMail({
           to: claim.claimedBy.email,
-          subject: `Follow-up: ${claim.book.title} (${claim.language}) — ${daysLeft} days left`,
+          subject: `Follow-up & Assistance: ${claim.book.title} (${claim.language}) — ${daysLeft} days left`,
           html: `
             <div style="font-family: Arial, sans-serif; max-width: 600px;">
               <h2 style="color: #1D9E75;">Shantikunj Audiobooks LMS</h2>
@@ -165,6 +169,7 @@ const sendFollowUps = async () => {
               <div style="background: #f5f5f5; padding: 16px; border-radius: 8px; margin: 16px 0;">
                 <strong>Book:</strong> ${claim.book.title}<br/>
                 <strong>Language:</strong> ${claim.language}<br/>
+                <strong>Task Stage:</strong> ${STAGE_LABEL[claim.claimType]}<br/>
                 <strong>Deadline:</strong> ${new Date(claim.deadline).toDateString()}<br/>
                 <strong style="color: ${daysLeft <= 2 ? '#E24B4A' : '#1D9E75'}">
                   Days Remaining: ${daysLeft} days
@@ -174,8 +179,8 @@ const sendFollowUps = async () => {
                 ? `<p style="color: #E24B4A;"><strong>⚠️ Your deadline is approaching soon!</strong></p>`
                 : `<p>We hope your work is going well!</p>`
               }
-              <p>If you need any assistance, please reach out to your admin or use the support system in the LMS.</p>
-              <a href="http://localhost:5173" 
+              <p>If you need any help or assistance, please reach out via the support system in LMS${supportContactEmail ? ` or email us at <strong>${supportContactEmail}</strong>` : ''}.</p>
+              <a href="${frontendUrl}" 
                  style="background: #1D9E75; color: white; padding: 12px 24px; 
                         text-decoration: none; border-radius: 6px; display: inline-block; margin: 16px 0;">
                 Open LMS Dashboard
@@ -187,12 +192,15 @@ const sendFollowUps = async () => {
           `
         })
 
-        // Update follow-up tracking
-        claim.lastFollowUpSent = now
-        claim.followUpCount += 1
-        await claim.save()
-
-        console.log(`Follow-up sent to ${claim.claimedBy.email} for ${claim.book.title}`)
+        if (followUpResult?.sent) {
+          // Update tracking only when follow-up is actually delivered.
+          claim.lastFollowUpSent = now
+          claim.followUpCount += 1
+          await claim.save()
+          console.log(`Follow-up sent to ${claim.claimedBy.email} for ${claim.book.title}`)
+        } else {
+          console.warn(`Follow-up skipped/failed for ${claim.claimedBy.email}: ${followUpResult?.error || 'Unknown mail error'}`)
+        }
       }
     }
 

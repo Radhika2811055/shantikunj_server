@@ -4,42 +4,57 @@ const Claim = require('../models/Claim')
 const sendMail = require('../config/mailer')
 const { createNotification, createBulkNotifications } = require('../services/notificationService')
 const { logAudit } = require('../services/auditService')
+const { appendTranslationConversionRecord, appendAudioGenerationRecord } = require('../services/excelAuditService')
+const { appendSpocApprovalRecord } = require('../services/googleSheetService')
+const { TRANSLATION_LANGUAGES } = require('../constants/languages')
 
 const REASSIGNMENT_THRESHOLD = 3
-const DEFAULT_TRANSLATION_INVITE_LANGUAGES = ['English']
-const BOOK_LANGUAGES = [
-  'Assamese',
-  'Bengali',
-  'Bhojpuri',
-  'Chattisgarhiya',
-  'Chinese',
-  'Dutch',
-  'English',
-  'French',
-  'Garhwali',
-  'German',
-  'Gujarati',
-  'Hindi',
-  'Japanese',
-  'Kannada',
-  'Kumaoni',
-  'Malayalam',
-  'Marathi',
-  'Nepali',
-  'Oriya',
-  'Punjabi',
-  'Russian',
-  'Sindhi',
-  'South Korean',
-  'Spanish',
-  'Tamil',
-  'Telugu',
-  'Urdu',
-  'Vietnamese',
-  'Arabic',
-  'Italian',
-  'Portuguese'
-]
+const MIN_DIRECT_ASSIGNMENT_UNCLAIMED_DAYS = 3
+const DEFAULT_TRANSLATION_INVITE_LANGUAGES = ['all']
+const LANGUAGE_TEAM_ROLES = ['spoc', 'translator', 'checker', 'audio_checker', 'recorder', 'regional_team']
+const FRONTEND_BASE_URL = String(process.env.FRONTEND_URL || 'http://localhost:5173').trim().replace(/\/+$/, '')
+const DIRECT_ASSIGNABLE_STAGE_CONFIG = {
+  translation: {
+    claimType: 'translation',
+    requiredRole: 'translator',
+    assigneeField: 'assignedTranslator',
+    deadlineField: 'translatorDeadline',
+    progressField: 'textStatus',
+    allowedProgressValues: ['not_started', 'translation_in_progress'],
+    assignedProgressValue: 'translation_in_progress',
+    stageLabel: 'Translation'
+  },
+  checking: {
+    claimType: 'checking',
+    requiredRole: 'checker',
+    assigneeField: 'assignedChecker',
+    deadlineField: 'checkerDeadline',
+    progressField: 'textStatus',
+    allowedProgressValues: ['translation_submitted', 'checking_in_progress'],
+    assignedProgressValue: 'checking_in_progress',
+    stageLabel: 'Text Vetting'
+  },
+  audio_generation: {
+    claimType: 'audio',
+    requiredRole: 'recorder',
+    assigneeField: 'assignedRecorder',
+    deadlineField: 'recorderDeadline',
+    progressField: 'audioStatus',
+    allowedProgressValues: ['not_started', 'audio_generated'],
+    assignedProgressValue: 'audio_generated',
+    stageLabel: 'Audio Generation'
+  },
+  audio_checking: {
+    claimType: 'audio_check',
+    requiredRole: 'audio_checker',
+    assigneeField: 'assignedAudioChecker',
+    deadlineField: 'audioCheckerDeadline',
+    progressField: 'audioStatus',
+    allowedProgressValues: ['audio_submitted', 'audio_checking_in_progress'],
+    assignedProgressValue: 'audio_checking_in_progress',
+    stageLabel: 'Audio Verification'
+  }
+}
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -117,14 +132,14 @@ const sendTranslationClaimInvites = async (book) => {
       continue
     }
 
-    const translators = await User.find({
+    const recipients = await User.find({
       language: version.language,
-      role: 'translator',
+      role: { $in: ['translator', 'spoc'] },
       status: 'approved',
       isActive: true
-    }).select('name email')
+    }).select('name email role')
 
-    if (translators.length === 0) {
+    if (recipients.length === 0) {
       version.interestEmailSent = false
       version.interestEmailSentAt = null
       inviteSummary.languagesWithoutRecipients.push(version.language)
@@ -139,7 +154,7 @@ const sendTranslationClaimInvites = async (book) => {
     inviteSummary.languagesWithRecipients += 1
 
     await createBulkNotifications({
-      userIds: translators.map((member) => member._id),
+      userIds: recipients.map((member) => member._id),
       type: 'task',
       title: 'New translation task available',
       message: `${book.title} (${version.language}) is open for claim.`,
@@ -151,10 +166,11 @@ const sendTranslationClaimInvites = async (book) => {
       }
     })
 
-    inviteSummary.totalEmailsAttempted += translators.length
+    inviteSummary.totalEmailsAttempted += recipients.length
 
     let sentCount = 0
-    for (const member of translators) {
+    for (const member of recipients) {
+      const recipientRoleLabel = member.role === 'spoc' ? 'SPOC' : 'translator'
       const sendResult = await sendMailWithRetry({
         to: member.email,
         subject: `New Translation Task - ${book.title} (${version.language})`,
@@ -167,10 +183,11 @@ const sendTranslationClaimInvites = async (book) => {
               <strong>Book:</strong> ${book.title}<br/>
               <strong>Book Number:</strong> ${book.bookNumber}<br/>
               <strong>Language:</strong> ${version.language}<br/>
+              <strong>Role:</strong> ${recipientRoleLabel}<br/>
               <strong>Task Stage:</strong> Translation
             </div>
             <p>Login to LMS and claim this task from Work Queue. The first eligible claimant gets assigned.</p>
-            <a href="http://localhost:5173"
+            <a href="${FRONTEND_BASE_URL}"
                style="background: #1D9E75; color: white; padding: 12px 24px;
                       text-decoration: none; border-radius: 6px; display: inline-block;">
               Login to Claim
@@ -187,6 +204,7 @@ const sendTranslationClaimInvites = async (book) => {
       } else {
         inviteSummary.failedEmails.push({
           language: version.language,
+          role: member.role,
           email: member.email,
           attempts: sendResult.attempts,
           reason: sendResult.error?.message || 'Unknown mail error'
@@ -197,7 +215,7 @@ const sendTranslationClaimInvites = async (book) => {
       await wait(180)
     }
 
-    const failedCount = translators.length - sentCount
+    const failedCount = recipients.length - sentCount
 
     inviteSummary.totalEmailsSent += sentCount
     inviteSummary.totalEmailsFailed += failedCount
@@ -224,6 +242,14 @@ const isGoogleDriveLink = (value) => value.includes('drive.google.com')
 const isDocumentLink = (value) => /\.(pdf|doc|docx|txt)(\?|$)/i.test(value) || isGoogleDriveLink(value)
 const isAudioLink = (value) => /\.(mp3|mp4)(\?|$)/i.test(value) || isGoogleDriveLink(value)
 
+const normalizeStoredUrls = (values = []) => {
+  return [...new Set(
+    values
+      .map((item) => (typeof item === 'string' ? item.trim() : ''))
+      .filter(Boolean)
+  )]
+}
+
 const normalizeAudioUrls = ({ audioUrl, audioUrls }) => {
   const fromArray = Array.isArray(audioUrls) ? audioUrls : []
   const fromSingle = audioUrl ? [audioUrl] : []
@@ -247,6 +273,18 @@ const normalizeDocumentUrls = ({ textFileUrl, textFileUrls }) => {
   return unique.filter((item) => isValidHttpUrl(item) && isDocumentLink(item))
 }
 
+const normalizeAccessibleDocumentUrls = ({ textFileUrl, textFileUrls }) => {
+  const fromArray = Array.isArray(textFileUrls) ? textFileUrls : []
+  const fromSingle = textFileUrl ? [textFileUrl] : []
+
+  const merged = [...fromArray, ...fromSingle]
+    .map((item) => (typeof item === 'string' ? item.trim() : ''))
+    .filter(Boolean)
+
+  const unique = [...new Set(merged)]
+  return unique.filter((item) => isValidHttpUrl(item))
+}
+
 const normalizeUploadedTranslationFiles = ({ files, file }) => {
   const fromArray = Array.isArray(files) ? files : []
   const fromFields = files && !Array.isArray(files) && typeof files === 'object'
@@ -263,6 +301,116 @@ const normalizeUploadedTranslationFiles = ({ files, file }) => {
 const isSameUser = (assignedUserId, currentUserId) => {
   if (!assignedUserId) return false
   return assignedUserId.toString() === currentUserId.toString()
+}
+
+const parseCloudinaryDeliveryUrl = (value) => {
+  try {
+    const parsed = new URL(String(value || '').trim())
+    if (!/(^|\.)res\.cloudinary\.com$/i.test(parsed.hostname)) return null
+
+    const segments = parsed.pathname.split('/').filter(Boolean)
+    if (segments.length < 5) return null
+
+    const resourceType = segments[1]
+    const deliveryType = segments[2]
+    if (!['image', 'video', 'raw'].includes(resourceType)) return null
+
+    const tail = segments.slice(3)
+    const versionIndex = tail.findIndex((part) => /^v\d+$/.test(part))
+    if (versionIndex === -1) return null
+
+    const version = Number(tail[versionIndex].slice(1))
+    const publicPathWithFormat = decodeURIComponent(tail.slice(versionIndex + 1).join('/'))
+    if (!publicPathWithFormat) return null
+
+    const lastSlashIndex = publicPathWithFormat.lastIndexOf('/')
+    const lastDotIndex = publicPathWithFormat.lastIndexOf('.')
+    const hasFormat = lastDotIndex > lastSlashIndex
+
+    const publicId = hasFormat
+      ? publicPathWithFormat.slice(0, lastDotIndex)
+      : publicPathWithFormat
+    const format = hasFormat
+      ? publicPathWithFormat.slice(lastDotIndex + 1)
+      : null
+
+    if (!publicId) return null
+
+    return {
+      resourceType,
+      deliveryType,
+      version,
+      publicId,
+      format
+    }
+  } catch (_error) {
+    return null
+  }
+}
+
+const toAccessibleTextUrl = (sourceUrl) => {
+  const original = String(sourceUrl || '').trim()
+  if (!original) return original
+
+  const asset = parseCloudinaryDeliveryUrl(original)
+  if (!asset) return original
+
+  const { cloudinary } = require('../middleware/uploadMiddleware')
+  try {
+    const expiresAt = Math.floor(Date.now() / 1000) + (10 * 60)
+    const privateDownloadUrl = cloudinary.utils.private_download_url(asset.publicId, asset.format || undefined, {
+      resource_type: asset.resourceType,
+      type: asset.deliveryType,
+      expires_at: expiresAt,
+      attachment: false
+    })
+
+    if (privateDownloadUrl) {
+      return privateDownloadUrl
+    }
+  } catch (_error) {
+    // Fall through to signed delivery URL.
+  }
+
+  const options = {
+    secure: true,
+    sign_url: true,
+    resource_type: asset.resourceType,
+    type: asset.deliveryType,
+    version: asset.version
+  }
+
+  if (asset.format) {
+    options.format = asset.format
+  }
+
+  const signedDeliveryUrl = cloudinary.url(asset.publicId, options)
+  if (signedDeliveryUrl) {
+    return signedDeliveryUrl
+  }
+
+  return original
+}
+
+const canAccessVersionText = (reqUser, version) => {
+  if (!reqUser || !version) return false
+  if (reqUser.role === 'admin') return true
+
+  if (
+    reqUser.role === 'spoc'
+    && String(reqUser.language || '').trim().toLowerCase() === String(version.language || '').trim().toLowerCase()
+  ) {
+    return true
+  }
+
+  return [
+    version.assignedTranslator,
+    version.assignedChecker,
+    version.assignedRecorder,
+    version.assignedAudioChecker,
+    version.lastCheckedBy,
+    version.spoc
+  ].some((memberId) => isSameUser(memberId, reqUser._id))
 }
 
 const notifyTaskCompletion = async ({ userId, book, version, actionLabel, metadata = {} }) => {
@@ -307,7 +455,200 @@ const hasConflictingActiveCheckingClaim = async (checkerId, exclude = null) => {
   return activeClaim
 }
 
-// ── Add a new book (admin only) ────────────────────────────
+const normalizeLanguageValue = (value) => String(value || '').trim().toLowerCase()
+
+const assignUnclaimedVersion = async (req, res) => {
+  try {
+    const { bookId, versionId } = req.params
+    const { assigneeId, daysCommitted = 3 } = req.body
+
+    const assignmentDays = Number(daysCommitted)
+    if (!Number.isInteger(assignmentDays) || assignmentDays < 1 || assignmentDays > 30) {
+      return res.status(400).json({ message: 'daysCommitted must be an integer between 1 and 30' })
+    }
+
+    const book = await Book.findById(bookId)
+    if (!book) return res.status(404).json({ message: 'Book not found' })
+
+    const version = book.languageVersions.id(versionId)
+    if (!version) return res.status(404).json({ message: 'Language version not found' })
+
+    const requesterLanguage = normalizeLanguageValue(req.user.language)
+    const versionLanguage = normalizeLanguageValue(version.language)
+
+    if (req.user.role === 'spoc' && requesterLanguage !== versionLanguage) {
+      return res.status(403).json({
+        message: 'SPOC can assign only within their own language.'
+      })
+    }
+
+    const now = new Date()
+    const lastUnclaimedAnchor = version.updatedAt || version.createdAt || book.updatedAt || book.createdAt
+    const minimumUnclaimedMs = MIN_DIRECT_ASSIGNMENT_UNCLAIMED_DAYS * 24 * 60 * 60 * 1000
+    const unclaimedAgeMs = now.getTime() - new Date(lastUnclaimedAnchor).getTime()
+
+    if (unclaimedAgeMs < minimumUnclaimedMs) {
+      return res.status(400).json({
+        message: `Direct assignment is allowed only after task remains unclaimed for at least ${MIN_DIRECT_ASSIGNMENT_UNCLAIMED_DAYS} days.`
+      })
+    }
+
+    const stageConfig = DIRECT_ASSIGNABLE_STAGE_CONFIG[version.currentStage]
+    if (!stageConfig) {
+      return res.status(400).json({
+        message: `Direct assignment is not available for stage: ${version.currentStage}`
+      })
+    }
+
+    if (stageConfig.progressField === 'audioStatus' && version.currentStage === 'audio_generation' && version.textStatus !== 'text_approved') {
+      return res.status(400).json({ message: 'Audio generation assignment is allowed only after text approval' })
+    }
+
+    const currentProgress = String(version[stageConfig.progressField] || '').trim()
+    if (!stageConfig.allowedProgressValues.includes(currentProgress)) {
+      return res.status(400).json({
+        message: `${stageConfig.stageLabel} assignment is not allowed in current state: ${currentProgress || 'unknown'}`
+      })
+    }
+
+    const existingAssignee = version[stageConfig.assigneeField]
+    if (version.isLocked || existingAssignee) {
+      return res.status(400).json({ message: 'This task is already claimed or assigned' })
+    }
+
+    const assignee = await User.findById(assigneeId)
+    if (!assignee || assignee.status !== 'approved' || !assignee.isActive) {
+      return res.status(404).json({ message: 'Selected assignee is not available' })
+    }
+
+    if (assignee.role !== stageConfig.requiredRole) {
+      return res.status(400).json({
+        message: `Selected user must be a ${stageConfig.requiredRole.replace('_', ' ')}`
+      })
+    }
+
+    if (assignee.language !== version.language) {
+      return res.status(400).json({ message: 'Selected assignee must belong to the same language' })
+    }
+
+    const activeClaimForTask = await Claim.findOne({
+      book: book._id,
+      language: version.language,
+      claimType: stageConfig.claimType,
+      status: 'active'
+    })
+
+    if (activeClaimForTask) {
+      return res.status(409).json({ message: 'This task already has an active claim' })
+    }
+
+    const existingAssigneeClaim = await Claim.findOne({
+      claimedBy: assignee._id,
+      status: 'active'
+    }).populate('book', 'title')
+
+    if (existingAssigneeClaim) {
+      return res.status(400).json({
+        message: `Selected assignee already has an active claim for ${existingAssigneeClaim.book?.title || 'another book'}.`
+      })
+    }
+
+    const deadline = new Date(now)
+    deadline.setDate(deadline.getDate() + assignmentDays)
+
+    await Claim.create({
+      book: book._id,
+      language: version.language,
+      claimedBy: assignee._id,
+      claimType: stageConfig.claimType,
+      daysCommitted: assignmentDays,
+      deadline,
+      status: 'active'
+    })
+
+    const fromProgress = version[stageConfig.progressField]
+    version[stageConfig.assigneeField] = assignee._id
+    version[stageConfig.deadlineField] = deadline
+    version[stageConfig.progressField] = stageConfig.assignedProgressValue
+    version.isLocked = true
+    version.lockedBy = assignee._id
+    version.lockedUntil = deadline
+    await book.save()
+
+    await sendMailWithRetry({
+      to: assignee.email,
+      subject: `Task Assigned by ${req.user.role.toUpperCase()} â€” ${book.title} (${version.language})`,
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px;">
+          <h2 style="color: #1D9E75;">Shantikunj Audiobooks LMS</h2>
+          <p>Pranam <strong>${assignee.name}</strong>,</p>
+          <p>You have been assigned a task directly.</p>
+          <div style="background: #f5f5f5; padding: 16px; border-radius: 8px; margin: 16px 0;">
+            <strong>Book:</strong> ${book.title}<br/>
+            <strong>Language:</strong> ${version.language}<br/>
+            <strong>Stage:</strong> ${stageConfig.stageLabel}<br/>
+            <strong>Deadline:</strong> ${deadline.toDateString()}
+          </div>
+          <p>Please login and continue your workflow from Work Queue.</p>
+        </div>
+      `
+    })
+
+    await createNotification({
+      userId: assignee._id,
+      type: 'task',
+      title: 'Task assigned directly',
+      message: `${book.title} (${version.language}) was assigned to you for ${stageConfig.stageLabel.toLowerCase()}.`,
+      metadata: {
+        bookId: book._id,
+        versionId: version._id,
+        language: version.language,
+        claimType: stageConfig.claimType,
+        assignedBy: req.user._id,
+        deadline
+      }
+    })
+
+    await logAudit({
+      req,
+      action: 'task_assigned_directly',
+      entityType: 'book_version',
+      entityId: version._id,
+      book: book._id,
+      versionId: version._id,
+      language: version.language,
+      fromState: String(fromProgress || stageConfig.progressField),
+      toState: stageConfig.assignedProgressValue,
+      metadata: {
+        assignedTo: assignee._id,
+        assignedRole: stageConfig.requiredRole,
+        claimType: stageConfig.claimType,
+        daysCommitted: assignmentDays,
+        deadline
+      }
+    })
+
+    return res.status(200).json({
+      message: `${stageConfig.stageLabel} task assigned successfully to ${assignee.name}.`,
+      version,
+      assignment: {
+        role: stageConfig.requiredRole,
+        claimType: stageConfig.claimType,
+        assignee: {
+          id: assignee._id,
+          name: assignee.name,
+          email: assignee.email
+        },
+        daysCommitted: assignmentDays,
+        deadline
+      }
+    })
+  } catch (error) {
+    return res.status(500).json({ message: 'Server error', error: error.message })
+  }
+}
+
+// â”€â”€ Add a new book (admin only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const addBook = async (req, res) => {
   try {
     const { title, bookNumber, description } = req.body
@@ -317,7 +658,7 @@ const addBook = async (req, res) => {
       return res.status(400).json({ message: `Book number ${bookNumber} already exists` })
     }
 
-    const languageVersions = BOOK_LANGUAGES.map((language) => ({
+    const languageVersions = TRANSLATION_LANGUAGES.map((language) => ({
       language,
       textStatus: 'not_started',
       audioStatus: 'not_started',
@@ -347,7 +688,7 @@ const addBook = async (req, res) => {
   }
 }
 
-// ── Get all books ──────────────────────────────────────────
+// â”€â”€ Get all books â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const getAllBooks = async (req, res) => {
   try {
     const books = await Book.find()
@@ -359,7 +700,7 @@ const getAllBooks = async (req, res) => {
   }
 }
 
-// ── Get single book ────────────────────────────────────────
+// â”€â”€ Get single book â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const getBookById = async (req, res) => {
   try {
     const book = await Book.findById(req.params.bookId)
@@ -377,7 +718,48 @@ const getBookById = async (req, res) => {
   }
 }
 
-// ── Get my assigned books ──────────────────────────────────
+const getTextAccessUrl = async (req, res) => {
+  try {
+    const { bookId, versionId } = req.params
+    const selectedIndex = Number.parseInt(req.query.index, 10)
+
+    const book = await Book.findById(bookId)
+    if (!book) return res.status(404).json({ message: 'Book not found' })
+
+    const version = book.languageVersions.id(versionId)
+    if (!version) return res.status(404).json({ message: 'Language version not found' })
+
+    if (!canAccessVersionText(req.user, version)) {
+      return res.status(403).json({ message: 'You are not allowed to access this text file' })
+    }
+
+    const urls = normalizeAccessibleDocumentUrls({
+      textFileUrl: version.textFileUrl,
+      textFileUrls: version.textFileUrls
+    })
+
+    if (urls.length === 0) {
+      return res.status(404).json({ message: 'No translation document found for this version' })
+    }
+
+    const resolvedIndex = Number.isInteger(selectedIndex) && selectedIndex >= 0 && selectedIndex < urls.length
+      ? selectedIndex
+      : 0
+
+    const sourceUrl = urls[resolvedIndex]
+    const url = toAccessibleTextUrl(sourceUrl)
+
+    return res.status(200).json({
+      url,
+      sourceUrl,
+      signed: url !== sourceUrl
+    })
+  } catch (error) {
+    return res.status(500).json({ message: 'Server error', error: error.message })
+  }
+}
+
+// â”€â”€ Get my assigned books â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const getMyAssignedBooks = async (req, res) => {
   try {
     const userId = req.user._id
@@ -441,17 +823,24 @@ const getMyAssignedBooks = async (req, res) => {
 
 const uploadTranslationDocument = async (req, res) => {
   try {
+    const { uploadToCloudinary } = require('../middleware/uploadMiddleware')
     const files = normalizeUploadedTranslationFiles(req)
 
     if (files.length === 0) {
       return res.status(400).json({ message: 'Please upload at least one PDF, DOC, DOCX, or TXT file' })
     }
 
-    const uploadedFiles = files.map((item) => ({
-      fileUrl: `${req.protocol}://${req.get('host')}/uploads/translations/${item.filename}`,
-      filename: item.originalname,
-      size: item.size
-    }))
+    const uploadedFiles = await Promise.all(
+      files.map(async (item) => {
+        const result = await uploadToCloudinary(item.buffer, item.originalname, 'auto')
+        return {
+          fileUrl: result.secure_url,
+          filename: item.originalname,
+          size: item.size,
+          cloudinaryId: result.public_id
+        }
+      })
+    )
 
     return res.status(200).json({
       message: uploadedFiles.length === 1
@@ -467,16 +856,23 @@ const uploadTranslationDocument = async (req, res) => {
 
 const uploadAudioFile = async (req, res) => {
   try {
+    const { uploadToCloudinary } = require('../middleware/uploadMiddleware')
     const files = Array.isArray(req.files) ? req.files : []
     if (files.length === 0) {
       return res.status(400).json({ message: 'Please upload at least one MP3 or MP4 file' })
     }
 
-    const uploadedFiles = files.map((file) => ({
-      fileUrl: `${req.protocol}://${req.get('host')}/uploads/audio/${file.filename}`,
-      filename: file.originalname,
-      size: file.size
-    }))
+    const uploadedFiles = await Promise.all(
+      files.map(async (file) => {
+        const result = await uploadToCloudinary(file.buffer, file.originalname, 'video')
+        return {
+          fileUrl: result.secure_url,
+          filename: file.originalname,
+          size: file.size,
+          cloudinaryId: result.public_id
+        }
+      })
+    )
 
     return res.status(200).json({
       message: 'Audio uploaded successfully',
@@ -488,7 +884,7 @@ const uploadAudioFile = async (req, res) => {
   }
 }
 
-// ── Translator submits translation ─────────────────────────
+// â”€â”€ Translator submits translation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const submitTranslation = async (req, res) => {
   try {
     const { bookId, versionId } = req.params
@@ -526,6 +922,17 @@ const submitTranslation = async (req, res) => {
     version.lockedUntil = null
     await book.save()
 
+    try {
+      appendTranslationConversionRecord({
+        book,
+        version,
+        submittedBy: req.user,
+        textUrls: validDocumentUrls
+      })
+    } catch (excelError) {
+      console.error('Excel audit logging failed for translation submission:', excelError.message)
+    }
+
     // Update claim status
     await Claim.findOneAndUpdate(
       { book: bookId, language: version.language, claimType: 'translation', status: 'active' },
@@ -559,7 +966,7 @@ const submitTranslation = async (req, res) => {
   }
 }
 
-// ── Checker submits vetted text ────────────────────────────
+// â”€â”€ Checker submits vetted text â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const submitVettedText = async (req, res) => {
   try {
     const { bookId, versionId } = req.params
@@ -590,7 +997,12 @@ const submitVettedText = async (req, res) => {
     if (decision === 'approved') {
       const checkerActionAt = new Date()
       version.textStatus = 'checking_submitted'
-      version.textFileUrl = textFileUrl || null
+      if (typeof textFileUrl === 'string' && textFileUrl.trim()) {
+        version.textFileUrl = textFileUrl.trim()
+      }
+      if (!version.textFileUrl && Array.isArray(version.textFileUrls) && version.textFileUrls.length > 0) {
+        version.textFileUrl = version.textFileUrls[0]
+      }
       version.currentStage = 'spoc_review'
       version.feedback = (feedback || '').trim() || null
       version.lastCheckedBy = req.user._id
@@ -628,7 +1040,7 @@ const submitVettedText = async (req, res) => {
       if (spoc) {
         await sendMail({
           to: spoc.email,
-          subject: `Text Ready for Review — ${book.title} (${version.language})`,
+          subject: `Text Ready for Review â€” ${book.title} (${version.language})`,
           html: `
             <div style="font-family: Arial, sans-serif; max-width: 600px;">
               <h2 style="color: #1D9E75;">Shantikunj Audiobooks LMS</h2>
@@ -639,7 +1051,7 @@ const submitVettedText = async (req, res) => {
                 <strong>Language:</strong> ${version.language}
               </div>
               <p>Please login to review and approve or reject.</p>
-              <a href="http://localhost:5173"
+              <a href="${FRONTEND_BASE_URL}"
                  style="background: #1D9E75; color: white; padding: 12px 24px;
                         text-decoration: none; border-radius: 6px; display: inline-block;">
                 Login to Review
@@ -711,7 +1123,7 @@ const submitVettedText = async (req, res) => {
     if (translator) {
       await sendMail({
         to: translator.email,
-        subject: `Text Revision Required — ${book.title} (${version.language})`,
+        subject: `Text Revision Required â€” ${book.title} (${version.language})`,
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px;">
             <h2 style="color: #E24B4A;">Shantikunj Audiobooks LMS</h2>
@@ -723,7 +1135,7 @@ const submitVettedText = async (req, res) => {
               <strong>Checker Feedback:</strong><br/>
               <p style="color: #E24B4A;">${checkerFeedback}</p>
             </div>
-            <a href="http://localhost:5173"
+            <a href="${FRONTEND_BASE_URL}"
                style="background: #1D9E75; color: white; padding: 12px 24px;
                       text-decoration: none; border-radius: 6px; display: inline-block;">
               Login to Revise
@@ -756,7 +1168,7 @@ const submitVettedText = async (req, res) => {
   }
 }
 
-// ── SPOC reviews text ──────────────────────────────────────
+// â”€â”€ SPOC reviews text â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const spocReviewText = async (req, res) => {
   try {
     const { bookId, versionId } = req.params
@@ -815,7 +1227,7 @@ const spocReviewText = async (req, res) => {
       for (const recorder of recorders) {
         await sendMail({
           to: recorder.email,
-          subject: `Text Approved — Audio Generation Ready — ${book.title} (${version.language})`,
+          subject: `Text Approved â€” Audio Generation Ready â€” ${book.title} (${version.language})`,
           html: `
             <div style="font-family: Arial, sans-serif; max-width: 600px;">
               <h2 style="color: #1D9E75;">Shantikunj Audiobooks LMS</h2>
@@ -826,7 +1238,7 @@ const spocReviewText = async (req, res) => {
                 <strong>Language:</strong> ${version.language}
               </div>
               <p>Please login to claim and start audio generation.</p>
-              <a href="http://localhost:5173"
+              <a href="${FRONTEND_BASE_URL}"
                  style="background: #1D9E75; color: white; padding: 12px 24px;
                         text-decoration: none; border-radius: 6px; display: inline-block;">
                 Login to Claim
@@ -883,7 +1295,7 @@ const spocReviewText = async (req, res) => {
     if (translator) {
       await sendMail({
         to: translator.email,
-        subject: `Text Revision Required by SPOC — ${book.title} (${version.language})`,
+        subject: `Text Revision Required by SPOC â€” ${book.title} (${version.language})`,
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px;">
             <h2 style="color: #E24B4A;">Shantikunj Audiobooks LMS</h2>
@@ -895,7 +1307,7 @@ const spocReviewText = async (req, res) => {
               <strong>SPOC Feedback:</strong><br/>
               <p style="color: #E24B4A;">${reviewFeedback}</p>
             </div>
-            <a href="http://localhost:5173"
+            <a href="${FRONTEND_BASE_URL}"
                style="background: #1D9E75; color: white; padding: 12px 24px;
                       text-decoration: none; border-radius: 6px; display: inline-block;">
               Login to Revise
@@ -944,7 +1356,7 @@ const spocReviewText = async (req, res) => {
   }
 }
 
-// ── Recorder submits audio ─────────────────────────────────
+// â”€â”€ Recorder submits audio â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const submitAudio = async (req, res) => {
   try {
     const { bookId, versionId } = req.params
@@ -987,6 +1399,17 @@ const submitAudio = async (req, res) => {
     version.lockedUntil = null
     await book.save()
 
+    try {
+      appendAudioGenerationRecord({
+        book,
+        version,
+        submittedBy: req.user,
+        audioUrls: normalizedAudioUrls
+      })
+    } catch (excelError) {
+      console.error('Excel audit logging failed for audio submission:', excelError.message)
+    }
+
     await Claim.findOneAndUpdate(
       { book: bookId, language: version.language, claimType: 'audio', status: 'active' },
       { status: 'submitted' }
@@ -1014,7 +1437,7 @@ const submitAudio = async (req, res) => {
     for (const checker of checkers) {
       await sendMail({
         to: checker.email,
-        subject: `Audio Ready for Verification — ${book.title} (${version.language})`,
+        subject: `Audio Ready for Verification â€” ${book.title} (${version.language})`,
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px;">
             <h2 style="color: #1D9E75;">Shantikunj Audiobooks LMS</h2>
@@ -1025,7 +1448,7 @@ const submitAudio = async (req, res) => {
               <strong>Language:</strong> ${version.language}
             </div>
             <p>Please login to claim and start audio verification.</p>
-            <a href="http://localhost:5173"
+            <a href="${FRONTEND_BASE_URL}"
                style="background: #1D9E75; color: white; padding: 12px 24px;
                       text-decoration: none; border-radius: 6px; display: inline-block;">
               Login to Claim
@@ -1058,7 +1481,7 @@ const submitAudio = async (req, res) => {
   }
 }
 
-// ── Checker submits audio review ───────────────────────────
+// â”€â”€ Checker submits audio review â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const submitAudioReview = async (req, res) => {
   try {
     const { bookId, versionId } = req.params
@@ -1148,7 +1571,7 @@ const submitAudioReview = async (req, res) => {
       if (spoc) {
         await sendMail({
           to: spoc.email,
-          subject: `Audio Ready for Final Approval — ${book.title} (${version.language})`,
+          subject: `Audio Ready for Final Approval â€” ${book.title} (${version.language})`,
           html: `
             <div style="font-family: Arial, sans-serif; max-width: 600px;">
               <h2 style="color: #1D9E75;">Shantikunj Audiobooks LMS</h2>
@@ -1160,7 +1583,7 @@ const submitAudioReview = async (req, res) => {
                 <strong>Feedback Deadline:</strong> ${parsedFeedbackDeadline.toLocaleString()}<br/>
                 ${checkerFeedback ? `<strong>Checker Notes:</strong> ${checkerFeedback}` : ''}
               </div>
-              <a href="http://localhost:5173"
+              <a href="${FRONTEND_BASE_URL}"
                  style="background: #1D9E75; color: white; padding: 12px 24px;
                         text-decoration: none; border-radius: 6px; display: inline-block;">
                 Login to Approve
@@ -1206,7 +1629,7 @@ const submitAudioReview = async (req, res) => {
     if (recorder) {
       await sendMail({
         to: recorder.email,
-        subject: `Audio Revision Required — ${book.title} (${version.language})`,
+        subject: `Audio Revision Required â€” ${book.title} (${version.language})`,
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px;">
             <h2 style="color: #E24B4A;">Shantikunj Audiobooks LMS</h2>
@@ -1218,7 +1641,7 @@ const submitAudioReview = async (req, res) => {
               <strong>Audio Checker Feedback:</strong><br/>
               <p style="color: #E24B4A;">${checkerFeedback}</p>
             </div>
-            <a href="http://localhost:5173"
+            <a href="${FRONTEND_BASE_URL}"
                style="background: #1D9E75; color: white; padding: 12px 24px;
                       text-decoration: none; border-radius: 6px; display: inline-block;">
               Login to Revise
@@ -1251,7 +1674,7 @@ const submitAudioReview = async (req, res) => {
   }
 }
 
-// ── SPOC final audio approval ──────────────────────────────
+// â”€â”€ SPOC final audio approval â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const spocAudioApproval = async (req, res) => {
   try {
     const { bookId, versionId } = req.params
@@ -1289,6 +1712,16 @@ const spocAudioApproval = async (req, res) => {
       version.blockerNote = null
       await book.save()
 
+      try {
+        await appendSpocApprovalRecord({
+          book,
+          version,
+          spocUser: req.user
+        })
+      } catch (sheetError) {
+        console.error('Google Sheet logging failed for SPOC approval:', sheetError.message)
+      }
+
       // Send approved audio to admin publish queue.
       const admins = await User.find({
         role: 'admin',
@@ -1299,7 +1732,7 @@ const spocAudioApproval = async (req, res) => {
       for (const admin of admins) {
         await sendMail({
           to: admin.email,
-          subject: `Audio Ready For Publish Approval — ${book.title} (${version.language})`,
+          subject: `Audio Ready For Publish Approval â€” ${book.title} (${version.language})`,
           html: `
             <div style="font-family: Arial, sans-serif; max-width: 600px;">
               <h2 style="color: #1D9E75;">Shantikunj Audiobooks LMS</h2>
@@ -1312,7 +1745,7 @@ const spocAudioApproval = async (req, res) => {
                 <strong>Feedback Deadline:</strong> ${version.feedbackDeadline ? new Date(version.feedbackDeadline).toLocaleString() : 'Not set'}
               </div>
               <p>Please review and publish from the admin dashboard when ready.</p>
-              <a href="http://localhost:5173"
+              <a href="${FRONTEND_BASE_URL}"
                  style="background: #1D9E75; color: white; padding: 12px 24px;
                         text-decoration: none; border-radius: 6px; display: inline-block;">
                 Open Admin Dashboard
@@ -1372,7 +1805,7 @@ const spocAudioApproval = async (req, res) => {
       if (recorder) {
         await sendMail({
           to: recorder.email,
-          subject: `Audio Revision Required — ${book.title} (${version.language})`,
+          subject: `Audio Revision Required â€” ${book.title} (${version.language})`,
           html: `
             <div style="font-family: Arial, sans-serif; max-width: 600px;">
               <h2 style="color: #E24B4A;">Shantikunj Audiobooks LMS</h2>
@@ -1384,7 +1817,7 @@ const spocAudioApproval = async (req, res) => {
                 <strong>Feedback:</strong><br/>
                 <p style="color: #E24B4A;">${spocFeedback}</p>
               </div>
-              <a href="http://localhost:5173"
+              <a href="${FRONTEND_BASE_URL}"
                  style="background: #1D9E75; color: white; padding: 12px 24px;
                         text-decoration: none; border-radius: 6px; display: inline-block;">
                 Login to Revise
@@ -1434,7 +1867,7 @@ const spocAudioApproval = async (req, res) => {
   }
 }
 
-// ── Admin publishes book version ───────────────────────────
+// â”€â”€ Admin publishes book version â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const publishBook = async (req, res) => {
   try {
     const { bookId, versionId } = req.params
@@ -1453,44 +1886,99 @@ const publishBook = async (req, res) => {
       return res.status(400).json({ message: 'Cannot publish while SPOC blocker is active' })
     }
 
+    const normalizedTextUrls = normalizeStoredUrls([
+      ...(Array.isArray(version.textFileUrls) ? version.textFileUrls : []),
+      version.textFileUrl
+    ])
+
+    const normalizedAudioUrls = normalizeStoredUrls([
+      ...(Array.isArray(version.audioFiles) ? version.audioFiles : []),
+      version.audioUrl
+    ])
+
+    const hasTranslatedText = Boolean(String(version.translatedText || '').trim()) || normalizedTextUrls.length > 0
+    if (!hasTranslatedText) {
+      return res.status(400).json({ message: 'Cannot publish without translated text saved for this language version' })
+    }
+
+    if (normalizedAudioUrls.length === 0) {
+      return res.status(400).json({ message: 'Cannot publish without generated audio saved for this language version' })
+    }
+
+    // Ensure canonical asset fields remain populated.
+    version.textFileUrl = normalizedTextUrls[0] || null
+    version.textFileUrls = normalizedTextUrls
+    version.audioUrl = normalizedAudioUrls[0] || null
+    version.audioFiles = normalizedAudioUrls
+
+    // Persist an immutable publish-time snapshot for final archived output.
+    version.publishedTextFileUrl = normalizedTextUrls[0] || null
+    version.publishedTextFileUrls = normalizedTextUrls
+    version.publishedTranslatedText = String(version.translatedText || '').trim() || null
+    version.publishedAudioUrl = normalizedAudioUrls[0] || null
+    version.publishedAudioFiles = normalizedAudioUrls
+    version.publishedAt = new Date()
+    version.publishedBy = req.user._id
+
     version.audioStatus = 'published'
     version.currentStage = 'published'
     version.isLocked = false
     await book.save()
 
-    // Notify entire language team
+    // Notify entire language team for this language on publish.
     const teamMembers = await User.find({
       language: version.language,
+      role: { $in: LANGUAGE_TEAM_ROLES },
       status: 'approved',
       isActive: true
-    })
+    }).select('_id name email role')
+
+    const publishMailSummary = {
+      attempted: teamMembers.length,
+      sent: 0,
+      failed: 0,
+      failures: []
+    }
 
     for (const member of teamMembers) {
-      await sendMail({
+      const sendResult = await sendMailWithRetry({
         to: member.email,
-        subject: `🎉 Published! — ${book.title} (${version.language})`,
+        subject: `ðŸŽ‰ Published! â€” ${book.title} (${version.language})`,
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px;">
             <h2 style="color: #1D9E75;">Shantikunj Audiobooks LMS</h2>
             <p>Pranam <strong>${member.name}</strong>,</p>
-            <p>🎉 The following audiobook has been officially published!</p>
+            <p>ðŸŽ‰ The following audiobook has been officially published!</p>
             <div style="background: #E1F5EE; padding: 16px; border-radius: 8px;">
               <strong>Book:</strong> ${book.title}<br/>
               <strong>Language:</strong> ${version.language}
             </div>
-            <p>Thank you for your contribution to this divine work! 🙏</p>
+            <p>Thank you for your contribution to this divine work! ðŸ™</p>
           </div>
         `
       })
+
+      if (sendResult.ok) {
+        publishMailSummary.sent += 1
+      } else {
+        publishMailSummary.failed += 1
+        publishMailSummary.failures.push({
+          email: member.email,
+          role: member.role,
+          reason: sendResult.error?.message || 'Unknown mail error'
+        })
+      }
     }
 
-    await createBulkNotifications({
-      userIds: teamMembers.map((member) => member._id),
-      type: 'system',
-      title: 'Audiobook published',
-      message: `${book.title} (${version.language}) is now published.`,
-      metadata: { bookId: book._id, versionId: version._id }
-    })
+    if (teamMembers.length > 0) {
+      await createBulkNotifications({
+        userIds: teamMembers.map((member) => member._id),
+        type: 'system',
+        title: 'Audiobook published',
+        message: `${book.title} (${version.language}) is now published.`,
+        metadata: { bookId: book._id, versionId: version._id }
+      })
+    }
 
     await logAudit({
       req,
@@ -1512,8 +2000,13 @@ const publishBook = async (req, res) => {
       metadata: { decision: 'published' }
     })
 
+    const mailStatus = publishMailSummary.attempted > 0
+      ? `Publication mails sent: ${publishMailSummary.sent}/${publishMailSummary.attempted}.`
+      : 'No active approved language team members to notify.'
+
     res.status(200).json({
-      message: `${book.title} (${version.language}) published successfully! 🎉`,
+      message: `${book.title} (${version.language}) published successfully! ðŸŽ‰ Final text/audio snapshot saved. ${mailStatus}`,
+      publishMailSummary,
       version
     })
 
@@ -1522,7 +2015,7 @@ const publishBook = async (req, res) => {
   }
 }
 
-// ── Update text status (manual) ────────────────────────────
+// â”€â”€ Update text status (manual) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const updateTextStatus = async (req, res) => {
   try {
     const { bookId, versionId } = req.params
@@ -1544,7 +2037,7 @@ const updateTextStatus = async (req, res) => {
   }
 }
 
-// ── Update audio status (manual) ───────────────────────────
+// â”€â”€ Update audio status (manual) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const updateAudioStatus = async (req, res) => {
   try {
     const { bookId, versionId } = req.params
@@ -1571,7 +2064,7 @@ const updateAudioStatus = async (req, res) => {
   }
 }
 
-// ── Assign to checker (admin/spoc) ─────────────────────────
+// â”€â”€ Assign to checker (admin/spoc) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const assignToChecker = async (req, res) => {
   try {
     const { bookId, versionId } = req.params
@@ -1838,8 +2331,10 @@ module.exports = {
   addBook,
   getAllBooks,
   getBookById,
+  getTextAccessUrl,
   uploadTranslationDocument,
   uploadAudioFile,
+  assignUnclaimedVersion,
   assignToChecker,
   reassignAfterRejections,
   setSpocBlocker,

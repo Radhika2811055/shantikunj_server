@@ -1,4 +1,5 @@
 const User = require('../models/User')
+const { normalizeTranslationLanguage } = require('../constants/languages')
 
 // ── Get all pending users ──────────────────────────────────
 const getPendingUsers = async (req, res) => {
@@ -23,10 +24,15 @@ const approveUser = async (req, res) => {
     }
 
     const finalRole = role || existing.requestedRole || 'translator'
-    const finalLanguage = language || existing.requestedLanguage || 'English'
+    const languageInput = language || existing.requestedLanguage || 'English'
+    const finalLanguage = normalizeTranslationLanguage(languageInput)
 
     if (finalRole === 'admin' || finalRole === 'pending') {
       return res.status(400).json({ message: 'Cannot approve user with this role' })
+    }
+
+    if (!finalLanguage) {
+      return res.status(400).json({ message: 'Cannot approve user with unsupported language' })
     }
 
     const user = await User.findByIdAndUpdate(

@@ -1,24 +1,15 @@
-const fs = require('fs')
-const path = require('path')
 const multer = require('multer')
+const cloudinary = require('cloudinary').v2
 
-const translationUploadsDir = path.join(__dirname, '..', 'uploads', 'translations')
-const audioUploadsDir = path.join(__dirname, '..', 'uploads', 'audio')
-
-fs.mkdirSync(translationUploadsDir, { recursive: true })
-fs.mkdirSync(audioUploadsDir, { recursive: true })
-
-const createStorage = (targetDir) => multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    cb(null, targetDir)
-  },
-  filename: (_req, file, cb) => {
-    const safeName = file.originalname.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9._-]/g, '')
-    cb(null, `${Date.now()}-${safeName}`)
-  }
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
 })
 
-const allowedMimeTypes = new Set([
+const storage = multer.memoryStorage()
+
+const allowedDocMimeTypes = new Set([
   'application/pdf',
   'application/msword',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -35,11 +26,11 @@ const allowedAudioMimeTypes = new Set([
 ])
 
 const uploadTranslationDoc = multer({
-  storage: createStorage(translationUploadsDir),
+  storage,
   limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const hasAllowedExtension = /\.(pdf|doc|docx|txt)$/i.test(file.originalname || '')
-    if (allowedMimeTypes.has(file.mimetype) || hasAllowedExtension) {
+    if (allowedDocMimeTypes.has(file.mimetype) || hasAllowedExtension) {
       cb(null, true)
       return
     }
@@ -49,7 +40,7 @@ const uploadTranslationDoc = multer({
 })
 
 const uploadAudioFile = multer({
-  storage: createStorage(audioUploadsDir),
+  storage,
   limits: { fileSize: 120 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const hasAllowedExtension = /\.(mp3|mp4)$/i.test(file.originalname || '')
@@ -62,7 +53,26 @@ const uploadAudioFile = multer({
   }
 })
 
+// Helper to upload buffer to Cloudinary
+const uploadToCloudinary = (buffer, fileName, resourceType = 'auto') => {
+  return new Promise((resolve, reject) => {
+    const uploadStream = cloudinary.uploader.upload_stream(
+      {
+        public_id: fileName.replace(/\.[^/.]+$/, ''),
+        resource_type: resourceType
+      },
+      (error, result) => {
+        if (error) reject(error)
+        else resolve(result)
+      }
+    )
+    uploadStream.end(buffer)
+  })
+}
+
 module.exports = {
   uploadTranslationDoc,
-  uploadAudioFile
+  uploadAudioFile,
+  uploadToCloudinary,
+  cloudinary
 }

@@ -152,6 +152,35 @@ const languageVersionSchema = new mongoose.Schema({
     type: [String],
     default: []
   },
+  publishedTextFileUrl: {
+    type: String,
+    default: null
+  },
+  publishedTextFileUrls: {
+    type: [String],
+    default: []
+  },
+  publishedTranslatedText: {
+    type: String,
+    default: null
+  },
+  publishedAudioUrl: {
+    type: String,
+    default: null
+  },
+  publishedAudioFiles: {
+    type: [String],
+    default: []
+  },
+  publishedAt: {
+    type: Date,
+    default: null
+  },
+  publishedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null
+  },
   reassignmentCount: {
     type: Number,
     default: 0

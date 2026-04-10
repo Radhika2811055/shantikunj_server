@@ -3,6 +3,10 @@ const bcrypt = require('bcryptjs')
 const jwt = require('jsonwebtoken')
 const sendMail = require('../config/mailer')
 const crypto = require('crypto')
+const {
+  TRANSLATION_LANGUAGES,
+  normalizeTranslationLanguage
+} = require('../constants/languages')
 
 const DISPOSABLE_DOMAINS = new Set([
   'test.com',
@@ -14,6 +18,10 @@ const DISPOSABLE_DOMAINS = new Set([
   'temp-mail.org',
   'fakeinbox.com'
 ])
+
+const ASSIGNABLE_MEMBER_ROLES = ['translator', 'checker', 'recorder', 'audio_checker']
+const normalizeLanguage = (value) => String(value || '').trim().toLowerCase()
+const FRONTEND_BASE_URL = String(process.env.FRONTEND_URL || 'http://localhost:5173').trim().replace(/\/+$/, '')
 
 const createAuthPayload = (user) => ({
   id: user._id,
@@ -35,7 +43,10 @@ const register = async (req, res) => {
     const { name, email, password, role, language } = req.body
     const normalizedName = String(name || '').trim()
     const normalizedEmail = String(email || '').trim().toLowerCase()
-    const normalizedLanguage = String(language || '').trim() || 'English'
+    const requestedLanguageInput = String(language || '').trim()
+    const normalizedLanguage = requestedLanguageInput
+      ? normalizeTranslationLanguage(requestedLanguageInput)
+      : 'English'
     const emailDomain = normalizedEmail.split('@')[1]
 
     if (normalizedName.length < 2) {
@@ -71,6 +82,10 @@ const register = async (req, res) => {
       return res.status(400).json({ message: 'Invalid role selected during registration' })
     }
 
+    if (!normalizedLanguage) {
+      return res.status(400).json({ message: 'Please select a supported language' })
+    }
+
     // Hash the password
     const hashedPassword = await bcrypt.hash(password, 10)
     // Create new user (pending by default)
@@ -93,6 +108,12 @@ const register = async (req, res) => {
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message })
   }
+}
+
+const getSupportedLanguages = (_req, res) => {
+  return res.status(200).json({
+    languages: TRANSLATION_LANGUAGES
+  })
 }
 
 // ── LOGIN ─────────────────────────────────────────────────
@@ -157,7 +178,7 @@ const googleCallback = async (req, res) => {
     // If user is not approved yet
     if (user.status !== 'approved') {
       return res.redirect(
-        `http://localhost:5173/login?error=pending`
+        `${FRONTEND_BASE_URL}/login?error=pending`
       )
     }
 
@@ -178,10 +199,10 @@ const googleCallback = async (req, res) => {
       language: user.language || ''
     })
 
-    res.redirect(`http://localhost:5173/auth/google/success?${params.toString()}`)
+    res.redirect(`${FRONTEND_BASE_URL}/auth/google/success?${params.toString()}`)
 
   } catch (error) {
-    res.redirect(`http://localhost:5173/login?error=server_error`)
+    res.redirect(`${FRONTEND_BASE_URL}/login?error=server_error`)
   }
 }
 
@@ -190,7 +211,7 @@ const googleCallback = async (req, res) => {
 const verifyEmail = async (req, res) => {
   try {
     const { token } = req.params
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173'
+    const frontendUrl = FRONTEND_BASE_URL
 
     const user = await User.findOne({
       emailVerificationToken: token,
@@ -208,7 +229,7 @@ const verifyEmail = async (req, res) => {
 
     return res.redirect(`${frontendUrl}/login?verified=1`)
   } catch (error) {
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173'
+    const frontendUrl = FRONTEND_BASE_URL
     return res.redirect(`${frontendUrl}/login?error=verify_failed`)
   }
 }
@@ -244,6 +265,63 @@ const getLanguageMembers = async (req, res) => {
   }
 }
 
+const getAssignableMembers = async (req, res) => {
+  try {
+    if (!['spoc', 'admin'].includes(req.user.role)) {
+      return res.status(403).json({ message: 'Only SPOC/Admin can access assignable members' })
+    }
+
+    const requestedLanguage = String(req.query.language || '').trim()
+    const targetRole = String(req.query.role || '').trim()
+
+    let targetLanguage = requestedLanguage
+
+    if (req.user.role === 'spoc') {
+      targetLanguage = String(req.user.language || '').trim()
+
+      if (!targetLanguage) {
+        return res.status(400).json({
+          message: 'SPOC language is not configured. Please contact admin.'
+        })
+      }
+
+      if (
+        requestedLanguage &&
+        normalizeLanguage(requestedLanguage) !== normalizeLanguage(req.user.language)
+      ) {
+        return res.status(403).json({
+          message: 'SPOC can access assignable members only for their own language.'
+        })
+      }
+    }
+
+    if (!targetLanguage) {
+      return res.status(400).json({ message: 'language query is required' })
+    }
+
+    if (targetRole && !ASSIGNABLE_MEMBER_ROLES.includes(targetRole)) {
+      return res.status(400).json({ message: 'Invalid role filter' })
+    }
+
+    const roleFilter = targetRole ? [targetRole] : ASSIGNABLE_MEMBER_ROLES
+
+    const members = await User.find({
+      language: targetLanguage,
+      role: { $in: roleFilter },
+      status: 'approved',
+      isActive: true
+    }).select('name email role language status isActive')
+
+    return res.status(200).json({
+      language: targetLanguage,
+      role: targetRole || null,
+      members
+    })
+  } catch (error) {
+    return res.status(500).json({ message: 'Server error', error: error.message })
+  }
+}
+
 const getMyProfile = async (req, res) => {
   try {
     const user = req.user
@@ -267,9 +345,13 @@ const getMyProfile = async (req, res) => {
 // ── Forgot password ────────────────────────────────────────
 const forgotPassword = async (req, res) => {
   try {
-    const { email } = req.body
+    const normalizedEmail = String(req.body?.email || '').trim().toLowerCase()
 
-    const user = await User.findOne({ email })
+    if (!normalizedEmail) {
+      return res.status(400).json({ message: 'Email is required' })
+    }
+
+    const user = await User.findOne({ email: normalizedEmail })
     if (!user) {
       return res.status(404).json({ message: 'No account found with this email' })
     }
@@ -289,8 +371,10 @@ const forgotPassword = async (req, res) => {
     user.resetTokenExpiry = resetTokenExpiry
     await user.save()
 
+    const resetLink = `${FRONTEND_BASE_URL}/reset-password/${resetToken}`
+
     // Send reset email
-    await sendMail({
+    const mailResult = await sendMail({
       to: user.email,
       subject: 'Password Reset — Shantikunj LMS',
       html: `
@@ -298,7 +382,7 @@ const forgotPassword = async (req, res) => {
           <h2 style="color: #1D9E75;">Shantikunj Audiobooks LMS</h2>
           <p>Pranam <strong>${user.name}</strong>,</p>
           <p>You requested a password reset. Click the button below:</p>
-          <a href="http://localhost:5173/reset-password/${resetToken}"
+           <a href="${resetLink}"
              style="background: #1D9E75; color: white; padding: 12px 24px;
                     text-decoration: none; border-radius: 6px; display: inline-block; margin: 16px 0;">
             Reset Password
@@ -312,6 +396,17 @@ const forgotPassword = async (req, res) => {
       `
     })
 
+    if (!mailResult?.sent) {
+      // Clear issued token when email fails to avoid storing unusable reset tokens.
+      user.resetToken = null
+      user.resetTokenExpiry = null
+      await user.save()
+
+      return res.status(503).json({
+        message: 'Unable to send reset email right now. Please try again in a few minutes.'
+      })
+    }
+
     res.status(200).json({ message: 'Password reset link sent to your email!' })
 
   } catch (error) {
@@ -323,7 +418,15 @@ const forgotPassword = async (req, res) => {
 const resetPassword = async (req, res) => {
   try {
     const { token } = req.params
-    const { newPassword } = req.body
+    const normalizedPassword = String(req.body?.newPassword || '')
+
+    if (!token) {
+      return res.status(400).json({ message: 'Reset token is required' })
+    }
+
+    if (normalizedPassword.length < 8) {
+      return res.status(400).json({ message: 'Password must be at least 8 characters long' })
+    }
 
     const user = await User.findOne({
       resetToken: token,
@@ -334,7 +437,7 @@ const resetPassword = async (req, res) => {
       return res.status(400).json({ message: 'Reset link is invalid or has expired' })
     }
 
-    const hashedPassword = await bcrypt.hash(newPassword, 10)
+    const hashedPassword = await bcrypt.hash(normalizedPassword, 10)
     user.password = hashedPassword
     user.resetToken = null
     user.resetTokenExpiry = null
@@ -350,4 +453,15 @@ const resetPassword = async (req, res) => {
 
 
 
-module.exports = { register, login, googleCallback, verifyEmail, getLanguageMembers, getMyProfile, forgotPassword, resetPassword }
+module.exports = {
+  register,
+  login,
+  googleCallback,
+  verifyEmail,
+  getLanguageMembers,
+  getAssignableMembers,
+  getMyProfile,
+  getSupportedLanguages,
+  forgotPassword,
+  resetPassword
+}

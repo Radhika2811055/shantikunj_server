@@ -4,6 +4,7 @@ const User = require('../models/User')
 const sendMail = require('../config/mailer')
 const { createNotification, createBulkNotifications } = require('../services/notificationService')
 const { logAudit } = require('../services/auditService')
+const FRONTEND_BASE_URL = String(process.env.FRONTEND_URL || 'http://localhost:5173').trim().replace(/\/+$/, '')
 
 const CLAIM_TO_ROLE = {
   translation: 'translator',
@@ -157,7 +158,7 @@ const getClaimLockQuery = (bookId, language, claimType) => {
   return baseQuery
 }
 
-// ── Admin sends interest email to language team ────────────
+// â”€â”€ Admin sends interest email to language team â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const sendInterestEmail = async (req, res) => {
   try {
     const { bookId } = req.params
@@ -213,7 +214,7 @@ const sendInterestEmail = async (req, res) => {
               <strong>Task Stage:</strong> ${STAGE_LABELS[stage]}
             </div>
             <p>Login to LMS and claim this task. The first eligible claimant gets assigned.</p>
-            <a href="http://localhost:5173"
+            <a href="${FRONTEND_BASE_URL}"
                style="background: #1D9E75; color: white; padding: 12px 24px;
                       text-decoration: none; border-radius: 6px; display: inline-block;">
               Login to Claim
@@ -270,7 +271,7 @@ const sendInterestEmail = async (req, res) => {
   }
 }
 
-// ── User claims a book version ─────────────────────────────
+// â”€â”€ User claims a book version â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const claimBook = async (req, res) => {
   try {
     const { bookId } = req.params
@@ -390,7 +391,7 @@ const claimBook = async (req, res) => {
 
     await sendMail({
       to: req.user.email,
-      subject: `Task Claimed — ${book.title} (${language})`,
+      subject: `Task Claimed â€” ${book.title} (${language})`,
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px;">
           <h2 style="color: #1D9E75;">Shantikunj Audiobooks LMS</h2>
@@ -437,7 +438,7 @@ const claimBook = async (req, res) => {
   }
 }
 
-// ── Get all available (unclaimed) versions ─────────────────
+// â”€â”€ Get all available (unclaimed) versions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const getAvailableBooks = async (req, res) => {
   try {
     await expireOverdueClaimsForUser(req.user._id)
@@ -508,7 +509,7 @@ const getAvailableBooks = async (req, res) => {
   }
 }
 
-// ── Get my active claim ────────────────────────────────────
+// â”€â”€ Get my active claim â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const getMyClaim = async (req, res) => {
   try {
     await expireOverdueClaimsForUser(req.user._id)
