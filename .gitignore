@@ -4,3 +4,5 @@ uploads/audio/
 uploads/translations/
 backups/
 *.log
+
+data_source/

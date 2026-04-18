@@ -20,8 +20,7 @@ const run = async () => {
       return
     }
 
-    const maxBook = await Book.findOne({}, { bookNumber: 1 }).sort({ bookNumber: -1 })
-    const nextBookNumber = Math.max(1, Number(maxBook?.bookNumber || 0) + 1)
+    const nextBookNumber = `SMOKE_${Date.now()}`
 
     const token = jwt.sign(
       { userId: admin._id, role: admin.role },

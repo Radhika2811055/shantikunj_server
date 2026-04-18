@@ -1,18 +1,55 @@
+const fs = require('fs')
+const path = require('path')
+const mongoose = require('mongoose')
 const Book = require('../models/Book')
 const User = require('../models/User')
 const Claim = require('../models/Claim')
-const sendMail = require('../config/mailer')
+const sendMailRaw = require('../config/mailer')
 const { createNotification, createBulkNotifications } = require('../services/notificationService')
 const { logAudit } = require('../services/auditService')
 const { appendTranslationConversionRecord, appendAudioGenerationRecord } = require('../services/excelAuditService')
 const { appendSpocApprovalRecord } = require('../services/googleSheetService')
 const { TRANSLATION_LANGUAGES } = require('../constants/languages')
+const { uploadToCloudinary } = require('../middleware/uploadMiddleware')
+
+let transliterateText = (value) => String(value || '')
+try {
+  ;({ transliterate: transliterateText } = require('transliteration'))
+} catch (_error) {
+  // Optional dependency fallback: plain text matching only.
+}
 
 const REASSIGNMENT_THRESHOLD = 3
 const MIN_DIRECT_ASSIGNMENT_UNCLAIMED_DAYS = 3
 const DEFAULT_TRANSLATION_INVITE_LANGUAGES = ['all']
 const LANGUAGE_TEAM_ROLES = ['spoc', 'translator', 'checker', 'audio_checker', 'recorder', 'regional_team']
 const FRONTEND_BASE_URL = String(process.env.FRONTEND_URL || 'http://localhost:5173').trim().replace(/\/+$/, '')
+const DATA_SOURCE_DIR = path.join(__dirname, '..', 'data_source')
+const MIN_PDF_FILE_MATCH_SCORE = 40
+const ALLOWED_WORKFLOW_EMAIL_SUBJECT_PATTERNS = [
+  /new translation task/i,
+  /published!/i
+]
+
+const isWorkflowEmailAllowed = (mailPayload) => {
+  const subject = String(mailPayload?.subject || '').trim()
+  if (!subject) return false
+  return ALLOWED_WORKFLOW_EMAIL_SUBJECT_PATTERNS.some((pattern) => pattern.test(subject))
+}
+
+const sendMail = async (mailPayload) => {
+  if (!isWorkflowEmailAllowed(mailPayload)) {
+    return {
+      sent: false,
+      skipped: true,
+      skippedByPolicy: true,
+      error: 'Email skipped by policy'
+    }
+  }
+
+  return sendMailRaw(mailPayload)
+}
+
 const DIRECT_ASSIGNABLE_STAGE_CONFIG = {
   translation: {
     claimType: 'translation',
@@ -81,6 +118,10 @@ const sendMailWithRetry = async (mailPayload, maxAttempts = 3) => {
       const result = await sendMail(mailPayload)
       if (result?.sent) {
         return { ok: true, attempts: attempt }
+      }
+
+      if (result?.skippedByPolicy) {
+        return { ok: true, skipped: true, attempts: attempt }
       }
 
       const fallbackMessage = result?.skipped
@@ -238,6 +279,8 @@ const isValidHttpUrl = (value) => {
   }
 }
 
+const isLikelyLocalUploadPath = (value) => /^(\/|\.\/)?(uploads|data_source)\//i.test(String(value || '').trim())
+
 const isGoogleDriveLink = (value) => value.includes('drive.google.com')
 const isDocumentLink = (value) => /\.(pdf|doc|docx|txt)(\?|$)/i.test(value) || isGoogleDriveLink(value)
 const isAudioLink = (value) => /\.(mp3|mp4)(\?|$)/i.test(value) || isGoogleDriveLink(value)
@@ -248,6 +291,181 @@ const normalizeStoredUrls = (values = []) => {
       .map((item) => (typeof item === 'string' ? item.trim() : ''))
       .filter(Boolean)
   )]
+}
+
+const asArray = (value) => (Array.isArray(value) ? value : [])
+
+const sanitizeOptionalString = (value) => {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  return trimmed || null
+}
+
+const toSearchableText = (value) => {
+  const normalized = sanitizeOptionalString(String(value || ''))
+  if (!normalized) return ''
+
+  const transliterated = sanitizeOptionalString(transliterateText(normalized)) || normalized
+  return transliterated
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ')
+    .replace(/[^a-z0-9\s]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+const tokenizeSearchText = (value) => {
+  const normalized = toSearchableText(value)
+  if (!normalized) return []
+  return normalized.split(' ').filter((token) => token.length >= 4)
+}
+
+const toConsonantSignature = (value) => {
+  const normalized = toSearchableText(value)
+  if (!normalized) return ''
+
+  return normalized
+    .replace(/[aeiou]/g, '')
+    .replace(/(.)\1+/g, '$1')
+}
+
+const sanitizeOptionalSize = (value) => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed < 0) return null
+  return Math.round(parsed)
+}
+
+const sanitizeOptionalDate = (value) => {
+  if (!value) return null
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return null
+  return parsed
+}
+
+const sanitizeBookNumberCode = (value) => {
+  if (value === undefined || value === null) return null
+
+  const normalized = String(value).trim().toUpperCase()
+  if (!normalized) return null
+  if (normalized.length > 64) return null
+  if (!/^[A-Z0-9][A-Z0-9_-]*$/.test(normalized)) return null
+
+  return normalized
+}
+
+const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+const toSafeCloudinaryPathPart = (value) => {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80)
+}
+
+const extractFileExtension = (value) => {
+  const fileName = String(value || '').trim()
+  const lastDot = fileName.lastIndexOf('.')
+  if (lastDot <= 0 || lastDot === fileName.length - 1) return ''
+  return fileName.slice(lastDot)
+}
+
+const inferDocumentExtensionFromMimeType = (mimeType) => {
+  const normalized = String(mimeType || '').toLowerCase()
+  if (normalized === 'application/pdf') return '.pdf'
+  if (normalized === 'application/msword') return '.doc'
+  if (normalized === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') return '.docx'
+  if (normalized === 'text/plain') return '.txt'
+  return ''
+}
+
+const isFileUrlForKind = (url, kind) => {
+  if (kind === 'audio') return isAudioLink(url)
+  return isDocumentLink(url)
+}
+
+const sanitizeFileMetadataEntry = (entry, kind) => {
+  if (!entry || typeof entry !== 'object') return null
+
+  const url = sanitizeOptionalString(entry.url)
+  if (!url || !isValidHttpUrl(url) || !isFileUrlForKind(url, kind)) return null
+
+  return {
+    url,
+    fileName: sanitizeOptionalString(entry.fileName || entry.filename || entry.originalName),
+    mimeType: sanitizeOptionalString(entry.mimeType || entry.mimetype),
+    size: sanitizeOptionalSize(entry.size),
+    cloudinaryId: sanitizeOptionalString(entry.cloudinaryId || entry.publicId || entry.public_id),
+    resourceType: sanitizeOptionalString(entry.resourceType || entry.resource_type),
+    format: sanitizeOptionalString(entry.format),
+    uploadedAt: sanitizeOptionalDate(entry.uploadedAt),
+    uploadedBy: entry.uploadedBy || null
+  }
+}
+
+const mergeMetadataEntriesByUrl = (entries = []) => {
+  const mergedByUrl = new Map()
+
+  for (const entry of entries) {
+    if (!entry?.url) continue
+
+    const existing = mergedByUrl.get(entry.url)
+    if (!existing) {
+      mergedByUrl.set(entry.url, { ...entry })
+      continue
+    }
+
+    const next = { ...existing }
+    const keys = ['fileName', 'mimeType', 'size', 'cloudinaryId', 'resourceType', 'format', 'uploadedAt', 'uploadedBy']
+    for (const key of keys) {
+      if (entry[key] !== null && entry[key] !== undefined && entry[key] !== '') {
+        next[key] = entry[key]
+      }
+    }
+    mergedByUrl.set(entry.url, next)
+  }
+
+  return [...mergedByUrl.values()]
+}
+
+const normalizeFileMetadata = ({ metadata = [], urls = [], kind }) => {
+  const fromMetadata = asArray(metadata)
+    .map((entry) => sanitizeFileMetadataEntry(entry, kind))
+    .filter(Boolean)
+
+  const fromUrls = normalizeStoredUrls(urls)
+    .map((url) => sanitizeFileMetadataEntry({ url }, kind))
+    .filter(Boolean)
+
+  return mergeMetadataEntriesByUrl([...fromUrls, ...fromMetadata])
+}
+
+const stampMetadataForSave = (entries = [], uploadedBy = null) => {
+  const now = new Date()
+  return entries.map((entry) => ({
+    ...entry,
+    uploadedAt: entry.uploadedAt || now,
+    uploadedBy: entry.uploadedBy || uploadedBy || null
+  }))
+}
+
+const buildUploadMetadata = ({ result, file, kind, uploadedBy = null }) => {
+  const parsedAsset = parseCloudinaryDeliveryUrl(result?.secure_url || '')
+
+  const metadata = sanitizeFileMetadataEntry({
+    url: result?.secure_url,
+    fileName: file?.originalname,
+    mimeType: file?.mimetype,
+    size: file?.size ?? result?.bytes,
+    cloudinaryId: result?.public_id,
+    resourceType: result?.resource_type || parsedAsset?.resourceType,
+    format: result?.format || parsedAsset?.format,
+    uploadedAt: result?.created_at || new Date(),
+    uploadedBy
+  }, kind)
+
+  return metadata
 }
 
 const normalizeAudioUrls = ({ audioUrl, audioUrls }) => {
@@ -283,6 +501,256 @@ const normalizeAccessibleDocumentUrls = ({ textFileUrl, textFileUrls }) => {
 
   const unique = [...new Set(merged)]
   return unique.filter((item) => isValidHttpUrl(item))
+}
+
+const normalizeSourcePdfReference = (candidate) => {
+  const normalized = sanitizeOptionalString(candidate)
+  if (!normalized) return null
+
+  if (isValidHttpUrl(normalized)) {
+    return normalized
+  }
+
+  if (/^\/\//.test(normalized)) {
+    return `https:${normalized}`
+  }
+
+  if (isLikelyLocalUploadPath(normalized)) {
+    const withoutDotPrefix = normalized.replace(/^\.\//, '')
+    return withoutDotPrefix.startsWith('/') ? withoutDotPrefix : `/${withoutDotPrefix}`
+  }
+
+  return null
+}
+
+const pickFirstValidUrl = (candidates = []) => {
+  for (const candidate of candidates) {
+    const normalized = normalizeSourcePdfReference(candidate)
+    if (normalized) {
+      return normalized
+    }
+  }
+
+  return null
+}
+
+const resolveBookSourcePdfUrl = (book) => {
+  const legacyStringCandidates = [book?.sourcePdf, book?.hindiPdf, book?.bookFile]
+    .filter((item) => typeof item === 'string')
+
+  const legacyObjectCandidates = [book?.sourcePdf, book?.hindiPdf, book?.bookFile]
+    .filter((item) => item && typeof item === 'object')
+    .flatMap((item) => [
+      item.url,
+      item.fileUrl,
+      item.secureUrl,
+      item.secure_url,
+      item.path,
+      item.location,
+      item.downloadUrl,
+      item.href
+    ])
+
+  const directUrl = pickFirstValidUrl([
+    book?.originalPdfUrl,
+    book?.sourcePdfUrl,
+    book?.hindiPdfUrl,
+    book?.hindiBookUrl,
+    book?.bookFileUrl,
+    book?.bookPdfUrl,
+    book?.pdfUrl,
+    book?.originalPdfMeta?.url,
+    book?.originalPdfMeta?.fileUrl,
+    book?.originalPdfMeta?.secureUrl,
+    book?.originalPdfMeta?.secure_url,
+    book?.sourcePdfMeta?.url,
+    book?.sourcePdfMeta?.fileUrl,
+    book?.sourcePdfMeta?.secureUrl,
+    book?.sourcePdfMeta?.secure_url,
+    ...legacyStringCandidates,
+    ...legacyObjectCandidates
+  ])
+
+  if (directUrl) {
+    return directUrl
+  }
+
+  const bookFiles = Array.isArray(book?.bookFiles) ? book.bookFiles : []
+  const flattenedCandidates = bookFiles.flatMap((item) => {
+    if (typeof item === 'string') return [item]
+    if (!item || typeof item !== 'object') return []
+    return [item.url, item.fileUrl, item.secureUrl, item.secure_url, item.path]
+  })
+
+  return pickFirstValidUrl(flattenedCandidates)
+}
+
+const getDataSourcePdfFiles = () => {
+  try {
+    return fs.readdirSync(DATA_SOURCE_DIR, { withFileTypes: true })
+      .filter((entry) => entry.isFile())
+      .map((entry) => entry.name)
+      .filter((name) => /\.pdf$/i.test(name))
+  } catch (_error) {
+    return []
+  }
+}
+
+const toDataSourcePublicUrl = (fileName) => {
+  const normalized = sanitizeOptionalString(fileName)
+  if (!normalized) return null
+  return `/data_source/${encodeURIComponent(normalized)}`
+}
+
+const resolveBookSourcePdfFromDataSource = (book) => {
+  const fileNames = getDataSourcePdfFiles()
+  if (fileNames.length === 0) return null
+
+  const lowerNameMap = new Map(fileNames.map((name) => [name.toLowerCase(), name]))
+  const basenameCandidates = [
+    book?.originalPdfMeta?.fileName,
+    book?.sourcePdfMeta?.fileName,
+    book?.sourcePdfFileName,
+    book?.hindiPdfFileName,
+    book?.bookFile,
+    book?.sourcePdf,
+    book?.hindiPdf
+  ]
+
+  for (const candidate of basenameCandidates) {
+    const normalizedCandidate = sanitizeOptionalString(typeof candidate === 'string' ? candidate : null)
+    if (!normalizedCandidate) continue
+
+    const baseName = path.basename(normalizedCandidate).toLowerCase()
+    const matchedName = lowerNameMap.get(baseName)
+    if (matchedName) {
+      return toDataSourcePublicUrl(matchedName)
+    }
+  }
+
+  const searchableTitle = toSearchableText(book?.title)
+  const titleTokens = tokenizeSearchText(book?.title)
+  const titleSkeletonTokens = titleTokens
+    .map((token) => toConsonantSignature(token))
+    .filter((token) => token.length >= 4)
+  const searchableBookNumber = toSearchableText(book?.bookNumber)
+  const compactBookNumber = searchableBookNumber.replace(/\s+/g, '')
+
+  let bestCandidate = null
+  let bestScore = 0
+
+  for (const fileName of fileNames) {
+    const searchableFileName = toSearchableText(fileName)
+    if (!searchableFileName) continue
+
+    let score = 0
+
+    if (compactBookNumber) {
+      const compactFileName = searchableFileName.replace(/\s+/g, '')
+      if (compactFileName.includes(compactBookNumber)) {
+        score += 130
+      }
+    }
+
+    if (searchableTitle && searchableFileName.includes(searchableTitle)) {
+      score += 120
+    }
+
+    if (titleTokens.length > 0) {
+      const matchedTokenCount = titleTokens.filter((token) => searchableFileName.includes(token)).length
+      score += matchedTokenCount * 20
+      if (matchedTokenCount === titleTokens.length) {
+        score += 40
+      }
+    }
+
+    if (titleSkeletonTokens.length > 0) {
+      const fileSkeletonTokens = searchableFileName
+        .split(' ')
+        .map((token) => toConsonantSignature(token))
+        .filter((token) => token.length >= 4)
+
+      const matchedSkeletonTokenCount = titleSkeletonTokens.filter((token) => (
+        fileSkeletonTokens.some((candidate) => candidate.includes(token) || token.includes(candidate))
+      )).length
+
+      score += matchedSkeletonTokenCount * 25
+      if (matchedSkeletonTokenCount === titleSkeletonTokens.length) {
+        score += 50
+      }
+    }
+
+    if (score > bestScore) {
+      bestScore = score
+      bestCandidate = fileName
+    }
+  }
+
+  if (!bestCandidate || bestScore < MIN_PDF_FILE_MATCH_SCORE) {
+    return null
+  }
+
+  return toDataSourcePublicUrl(bestCandidate)
+}
+
+const buildCloudinaryUrlFromPublicId = (publicId) => {
+  const normalized = sanitizeOptionalString(publicId)
+  if (!normalized) return null
+
+  const { cloudinary } = require('../middleware/uploadMiddleware')
+
+  try {
+    const expiresAt = Math.floor(Date.now() / 1000) + (10 * 60)
+    const privateDownloadUrl = cloudinary.utils.private_download_url(normalized, undefined, {
+      resource_type: 'raw',
+      type: 'upload',
+      expires_at: expiresAt,
+      attachment: false
+    })
+    if (privateDownloadUrl) return privateDownloadUrl
+  } catch (_error) {
+    // Fall through to signed delivery URL.
+  }
+
+  try {
+    const signedUrl = cloudinary.url(normalized, {
+      secure: true,
+      sign_url: true,
+      resource_type: 'raw',
+      type: 'upload'
+    })
+    return sanitizeOptionalString(signedUrl)
+  } catch (_error) {
+    return null
+  }
+}
+
+const toAbsoluteServerUrl = (req, value) => {
+  const normalized = sanitizeOptionalString(value)
+  if (!normalized) return normalized
+  if (isValidHttpUrl(normalized)) return normalized
+
+  const protocolHeader = sanitizeOptionalString(req.get('x-forwarded-proto'))
+  const protocol = protocolHeader
+    ? protocolHeader.split(',')[0].trim()
+    : (req.protocol || 'http')
+
+  if (/^\/\//.test(normalized)) {
+    return `${protocol}:${normalized}`
+  }
+
+  const pathValue = normalized.startsWith('/')
+    ? normalized
+    : `/${normalized.replace(/^\.\//, '')}`
+
+  const hostHeader = sanitizeOptionalString(req.get('x-forwarded-host')) || sanitizeOptionalString(req.get('host'))
+  const host = hostHeader ? hostHeader.split(',')[0].trim() : null
+
+  if (!host) {
+    return pathValue
+  }
+
+  return `${protocol}://${host}${pathValue}`
 }
 
 const normalizeUploadedTranslationFiles = ({ files, file }) => {
@@ -387,6 +855,55 @@ const toAccessibleTextUrl = (sourceUrl) => {
   const signedDeliveryUrl = cloudinary.url(asset.publicId, options)
   if (signedDeliveryUrl) {
     return signedDeliveryUrl
+  }
+
+  return original
+}
+
+const toDirectDownloadUrl = (sourceUrl, { fileName = 'book-source' } = {}) => {
+  const original = String(sourceUrl || '').trim()
+  if (!original) return original
+
+  const asset = parseCloudinaryDeliveryUrl(original)
+  if (!asset) return original
+
+  const { cloudinary } = require('../middleware/uploadMiddleware')
+
+  try {
+    const expiresAt = Math.floor(Date.now() / 1000) + (10 * 60)
+    const extension = asset.format ? `.${asset.format}` : ''
+    const attachmentName = `${toSafeCloudinaryPathPart(fileName) || 'book-source'}${extension}`
+
+    const privateDownloadUrl = cloudinary.utils.private_download_url(asset.publicId, asset.format || undefined, {
+      resource_type: asset.resourceType,
+      type: asset.deliveryType,
+      expires_at: expiresAt,
+      attachment: attachmentName
+    })
+
+    if (privateDownloadUrl) {
+      return privateDownloadUrl
+    }
+  } catch (_error) {
+    // Fall through to signed delivery URL with attachment flag.
+  }
+
+  const options = {
+    secure: true,
+    sign_url: true,
+    resource_type: asset.resourceType,
+    type: asset.deliveryType,
+    version: asset.version,
+    flags: 'attachment'
+  }
+
+  if (asset.format) {
+    options.format = asset.format
+  }
+
+  const signedAttachmentUrl = cloudinary.url(asset.publicId, options)
+  if (signedAttachmentUrl) {
+    return signedAttachmentUrl
   }
 
   return original
@@ -575,25 +1092,6 @@ const assignUnclaimedVersion = async (req, res) => {
     version.lockedUntil = deadline
     await book.save()
 
-    await sendMailWithRetry({
-      to: assignee.email,
-      subject: `Task Assigned by ${req.user.role.toUpperCase()} â€” ${book.title} (${version.language})`,
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px;">
-          <h2 style="color: #1D9E75;">Shantikunj Audiobooks LMS</h2>
-          <p>Pranam <strong>${assignee.name}</strong>,</p>
-          <p>You have been assigned a task directly.</p>
-          <div style="background: #f5f5f5; padding: 16px; border-radius: 8px; margin: 16px 0;">
-            <strong>Book:</strong> ${book.title}<br/>
-            <strong>Language:</strong> ${version.language}<br/>
-            <strong>Stage:</strong> ${stageConfig.stageLabel}<br/>
-            <strong>Deadline:</strong> ${deadline.toDateString()}
-          </div>
-          <p>Please login and continue your workflow from Work Queue.</p>
-        </div>
-      `
-    })
-
     await createNotification({
       userId: assignee._id,
       type: 'task',
@@ -651,11 +1149,81 @@ const assignUnclaimedVersion = async (req, res) => {
 // â”€â”€ Add a new book (admin only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const addBook = async (req, res) => {
   try {
-    const { title, bookNumber, description } = req.body
+    const title = sanitizeOptionalString(req.body?.title)
+    const description = sanitizeOptionalString(req.body?.description)
+    const parsedBookNumber = sanitizeBookNumberCode(req.body?.bookNumber)
 
-    const existing = await Book.findOne({ bookNumber })
+    if (!title) {
+      return res.status(400).json({ message: 'title is required' })
+    }
+
+    if (!parsedBookNumber) {
+      return res.status(400).json({ message: 'bookNumber is required and must use letters/numbers with optional _ or - (example: H_KD_06)' })
+    }
+
+    const existing = await Book.findOne({ bookNumber: parsedBookNumber })
     if (existing) {
-      return res.status(400).json({ message: `Book number ${bookNumber} already exists` })
+      return res.status(400).json({ message: `Book number ${parsedBookNumber} already exists` })
+    }
+
+    let originalPdfUrl = null
+    let originalPdfPublicId = null
+    let originalPdfMeta = null
+
+    if (req.file) {
+      const extension = extractFileExtension(req.file.originalname) || inferDocumentExtensionFromMimeType(req.file.mimetype)
+      const safeTitle = toSafeCloudinaryPathPart(title) || 'book'
+      const publicId = `books/${parsedBookNumber}-${safeTitle}-${Date.now()}`
+
+      const uploadResult = await uploadToCloudinary(
+        req.file.buffer,
+        `${publicId}${extension}`,
+        'raw'
+      )
+
+      const parsedAsset = parseCloudinaryDeliveryUrl(uploadResult?.secure_url || '')
+
+      originalPdfMeta = sanitizeFileMetadataEntry({
+        url: uploadResult?.secure_url,
+        fileName: req.file.originalname,
+        mimeType: req.file.mimetype,
+        size: req.file.size ?? uploadResult?.bytes,
+        cloudinaryId: uploadResult?.public_id || parsedAsset?.publicId,
+        resourceType: uploadResult?.resource_type || parsedAsset?.resourceType,
+        format: uploadResult?.format || parsedAsset?.format,
+        uploadedAt: uploadResult?.created_at || new Date(),
+        uploadedBy: req.user?._id || null
+      }, 'document')
+
+      originalPdfUrl = originalPdfMeta?.url || null
+      originalPdfPublicId = originalPdfMeta?.cloudinaryId || null
+    } else {
+      const bodySourceUrl = pickFirstValidUrl([
+        req.body?.originalPdfUrl,
+        req.body?.sourcePdfUrl,
+        req.body?.hindiPdfUrl,
+        req.body?.bookFileUrl,
+        req.body?.bookPdfUrl,
+        req.body?.pdfUrl
+      ])
+
+      if (bodySourceUrl) {
+        originalPdfUrl = bodySourceUrl
+        originalPdfPublicId = sanitizeOptionalString(req.body?.originalPdfPublicId)
+          || sanitizeOptionalString(req.body?.sourcePdfPublicId)
+          || null
+
+        originalPdfMeta = {
+          url: bodySourceUrl,
+          fileName: sanitizeOptionalString(req.body?.originalPdfFileName)
+            || sanitizeOptionalString(req.body?.sourcePdfFileName)
+            || null,
+          mimeType: /\.pdf(\?|$)/i.test(bodySourceUrl) ? 'application/pdf' : null,
+          cloudinaryId: originalPdfPublicId,
+          uploadedAt: new Date(),
+          uploadedBy: req.user?._id || null
+        }
+      }
     }
 
     const languageVersions = TRANSLATION_LANGUAGES.map((language) => ({
@@ -667,8 +1235,11 @@ const addBook = async (req, res) => {
 
     const book = await Book.create({
       title,
-      bookNumber,
+      bookNumber: parsedBookNumber,
       description,
+      originalPdfUrl,
+      originalPdfPublicId,
+      originalPdfMeta,
       languageVersions,
       createdBy: req.user._id
     })
@@ -703,6 +1274,10 @@ const getAllBooks = async (req, res) => {
 // â”€â”€ Get single book â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const getBookById = async (req, res) => {
   try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.bookId)) {
+      return res.status(400).json({ message: 'Invalid bookId' })
+    }
+
     const book = await Book.findById(req.params.bookId)
       .populate('createdBy', 'name email')
       .populate('languageVersions.assignedTranslator', 'name email')
@@ -738,6 +1313,12 @@ const getTextAccessUrl = async (req, res) => {
       textFileUrls: version.textFileUrls
     })
 
+    const normalizedTextFilesMeta = normalizeFileMetadata({
+      metadata: version.textFilesMeta,
+      urls,
+      kind: 'document'
+    })
+
     if (urls.length === 0) {
       return res.status(404).json({ message: 'No translation document found for this version' })
     }
@@ -748,13 +1329,105 @@ const getTextAccessUrl = async (req, res) => {
 
     const sourceUrl = urls[resolvedIndex]
     const url = toAccessibleTextUrl(sourceUrl)
+    const selectedFile = normalizedTextFilesMeta[resolvedIndex] || { url: sourceUrl }
 
     return res.status(200).json({
       url,
       sourceUrl,
-      signed: url !== sourceUrl
+      signed: url !== sourceUrl,
+      file: selectedFile,
+      files: normalizedTextFilesMeta
     })
   } catch (error) {
+    return res.status(500).json({ message: 'Server error', error: error.message })
+  }
+}
+
+const findBookForSourcePdf = async ({ bookId, bookNumber }) => {
+  if (bookId && mongoose.Types.ObjectId.isValid(bookId)) {
+    const byId = await Book.findById(bookId)
+    if (byId) return byId
+  }
+
+  const normalizedBookNumber = sanitizeBookNumberCode(bookNumber)
+  if (normalizedBookNumber) {
+    const byBookNumber = await Book.findOne({ bookNumber: normalizedBookNumber })
+    if (byBookNumber) return byBookNumber
+
+    const caseInsensitive = await Book.findOne({
+      bookNumber: { $regex: `^${escapeRegex(normalizedBookNumber)}$`, $options: 'i' }
+    })
+    if (caseInsensitive) return caseInsensitive
+  }
+
+  return null
+}
+
+const getSourcePdfAccessUrl = async (req, res) => {
+  try {
+    const paramBookId = sanitizeOptionalString(req.params.bookId)
+    const queryBookId = sanitizeOptionalString(req.query.bookId)
+      || sanitizeOptionalString(req.query.id)
+    const bookId = paramBookId || queryBookId
+    const pathBookNumber = sanitizeOptionalString(req.params.bookNumber)
+    const queryBookNumber = sanitizeOptionalString(req.query.bookNumber)
+    const requestedBookNumber = pathBookNumber || queryBookNumber
+
+    if (!bookId && !requestedBookNumber) {
+      return res.status(400).json({ message: 'Provide either bookId or bookNumber' })
+    }
+
+    if (bookId && !mongoose.Types.ObjectId.isValid(bookId) && !requestedBookNumber) {
+      return res.status(400).json({ message: 'Invalid bookId' })
+    }
+
+    const book = await findBookForSourcePdf({
+      bookId,
+      bookNumber: requestedBookNumber
+    })
+
+    if (!book) {
+      return res.status(404).json({ message: 'Book not found' })
+    }
+
+    let sourceUrl = resolveBookSourcePdfUrl(book)
+
+    if (!sourceUrl) {
+      sourceUrl = buildCloudinaryUrlFromPublicId(
+        book?.originalPdfPublicId
+        || book?.originalPdfMeta?.cloudinaryId
+        || book?.sourcePdfPublicId
+        || book?.hindiPdfPublicId
+      )
+    }
+
+    if (!sourceUrl) {
+      sourceUrl = resolveBookSourcePdfFromDataSource(book)
+    }
+
+    if (!sourceUrl) {
+      return res.status(404).json({ message: 'Hindi PDF not available for this book' })
+    }
+
+    const absoluteSourceUrl = toAbsoluteServerUrl(req, sourceUrl)
+
+    const downloadUrl = toDirectDownloadUrl(absoluteSourceUrl, {
+      fileName: `${book.bookNumber || 'book'}-hindi-source`
+    })
+
+    const absoluteDownloadUrl = toAbsoluteServerUrl(req, downloadUrl)
+
+    return res.status(200).json({
+      url: absoluteDownloadUrl,
+      downloadUrl: absoluteDownloadUrl,
+      sourceUrl: absoluteSourceUrl,
+      directDownload: true
+    })
+  } catch (error) {
+    if (error?.name === 'CastError') {
+      return res.status(400).json({ message: 'Invalid bookId' })
+    }
+
     return res.status(500).json({ message: 'Server error', error: error.message })
   }
 }
@@ -833,11 +1506,22 @@ const uploadTranslationDocument = async (req, res) => {
     const uploadedFiles = await Promise.all(
       files.map(async (item) => {
         const result = await uploadToCloudinary(item.buffer, item.originalname, 'auto')
+        const metadata = buildUploadMetadata({
+          result,
+          file: item,
+          kind: 'document',
+          uploadedBy: req.user?._id
+        })
+
         return {
           fileUrl: result.secure_url,
           filename: item.originalname,
           size: item.size,
-          cloudinaryId: result.public_id
+          mimeType: item.mimetype,
+          cloudinaryId: result.public_id,
+          resourceType: result.resource_type || metadata?.resourceType || null,
+          format: result.format || metadata?.format || null,
+          metadata
         }
       })
     )
@@ -865,11 +1549,22 @@ const uploadAudioFile = async (req, res) => {
     const uploadedFiles = await Promise.all(
       files.map(async (file) => {
         const result = await uploadToCloudinary(file.buffer, file.originalname, 'video')
+        const metadata = buildUploadMetadata({
+          result,
+          file,
+          kind: 'audio',
+          uploadedBy: req.user?._id
+        })
+
         return {
           fileUrl: result.secure_url,
           filename: file.originalname,
           size: file.size,
-          cloudinaryId: result.public_id
+          mimeType: file.mimetype,
+          cloudinaryId: result.public_id,
+          resourceType: result.resource_type || metadata?.resourceType || null,
+          format: result.format || metadata?.format || null,
+          metadata
         }
       })
     )
@@ -888,11 +1583,17 @@ const uploadAudioFile = async (req, res) => {
 const submitTranslation = async (req, res) => {
   try {
     const { bookId, versionId } = req.params
-    const { textFileUrl, textFileUrls } = req.body
+    const { textFileUrl, textFileUrls, textFilesMeta, textFiles } = req.body
 
-    const validDocumentUrls = normalizeDocumentUrls({ textFileUrl, textFileUrls })
+    const legacyDocumentUrls = normalizeDocumentUrls({ textFileUrl, textFileUrls })
+    const normalizedTextFilesMeta = normalizeFileMetadata({
+      metadata: [...asArray(textFilesMeta), ...asArray(textFiles)],
+      urls: legacyDocumentUrls,
+      kind: 'document'
+    })
+    const validDocumentUrls = normalizedTextFilesMeta.map((item) => item.url)
 
-    if (validDocumentUrls.length === 0) {
+    if (normalizedTextFilesMeta.length === 0) {
       return res.status(400).json({
         message: 'Please provide a valid document link (PDF/DOC/DOCX/TXT or Google Drive link)'
       })
@@ -914,8 +1615,9 @@ const submitTranslation = async (req, res) => {
     }
 
     version.textStatus = 'translation_submitted'
-  version.textFileUrl = validDocumentUrls[0]
-  version.textFileUrls = validDocumentUrls
+    version.textFileUrl = validDocumentUrls[0]
+    version.textFileUrls = validDocumentUrls
+    version.textFilesMeta = stampMetadataForSave(normalizedTextFilesMeta, req.user?._id)
     version.currentStage = 'checking'
     version.isLocked = false
     version.lockedBy = null
@@ -970,7 +1672,7 @@ const submitTranslation = async (req, res) => {
 const submitVettedText = async (req, res) => {
   try {
     const { bookId, versionId } = req.params
-    const { textFileUrl, decision = 'approved', feedback } = req.body
+    const { textFileUrl, textFilesMeta, textFiles, decision = 'approved', feedback } = req.body
 
     const book = await Book.findById(bookId)
     if (!book) return res.status(404).json({ message: 'Book not found' })
@@ -997,9 +1699,24 @@ const submitVettedText = async (req, res) => {
     if (decision === 'approved') {
       const checkerActionAt = new Date()
       version.textStatus = 'checking_submitted'
-      if (typeof textFileUrl === 'string' && textFileUrl.trim()) {
-        version.textFileUrl = textFileUrl.trim()
+
+      const approvedTextFilesMeta = normalizeFileMetadata({
+        metadata: [...asArray(version.textFilesMeta), ...asArray(textFilesMeta), ...asArray(textFiles)],
+        urls: [
+          ...(Array.isArray(version.textFileUrls) ? version.textFileUrls : []),
+          version.textFileUrl,
+          sanitizeOptionalString(textFileUrl)
+        ],
+        kind: 'document'
+      })
+
+      const approvedTextUrls = approvedTextFilesMeta.map((item) => item.url)
+      if (approvedTextUrls.length > 0) {
+        version.textFileUrl = approvedTextUrls[0]
+        version.textFileUrls = approvedTextUrls
+        version.textFilesMeta = stampMetadataForSave(approvedTextFilesMeta, req.user?._id)
       }
+
       if (!version.textFileUrl && Array.isArray(version.textFileUrls) && version.textFileUrls.length > 0) {
         version.textFileUrl = version.textFileUrls[0]
       }
@@ -1097,7 +1814,22 @@ const submitVettedText = async (req, res) => {
     version.assignedChecker = null
     version.checkerDeadline = null
     if (textFileUrl) {
-      version.textFileUrl = textFileUrl
+      const revisionTextFilesMeta = normalizeFileMetadata({
+        metadata: [...asArray(version.textFilesMeta), ...asArray(textFilesMeta), ...asArray(textFiles)],
+        urls: [
+          ...(Array.isArray(version.textFileUrls) ? version.textFileUrls : []),
+          version.textFileUrl,
+          textFileUrl
+        ],
+        kind: 'document'
+      })
+
+      const revisionTextUrls = revisionTextFilesMeta.map((item) => item.url)
+      if (revisionTextUrls.length > 0) {
+        version.textFileUrl = revisionTextUrls[0]
+        version.textFileUrls = revisionTextUrls
+        version.textFilesMeta = stampMetadataForSave(revisionTextFilesMeta, req.user?._id)
+      }
     }
     await book.save()
 
@@ -1360,10 +2092,16 @@ const spocReviewText = async (req, res) => {
 const submitAudio = async (req, res) => {
   try {
     const { bookId, versionId } = req.params
-    const { audioUrl, audioUrls } = req.body
-    const normalizedAudioUrls = normalizeAudioUrls({ audioUrl, audioUrls })
+    const { audioUrl, audioUrls, audioFilesMeta, audioFiles } = req.body
+    const legacyAudioUrls = normalizeAudioUrls({ audioUrl, audioUrls })
+    const normalizedAudioFilesMeta = normalizeFileMetadata({
+      metadata: [...asArray(audioFilesMeta), ...asArray(audioFiles)],
+      urls: legacyAudioUrls,
+      kind: 'audio'
+    })
+    const normalizedAudioUrls = normalizedAudioFilesMeta.map((item) => item.url)
 
-    if (normalizedAudioUrls.length === 0) {
+    if (normalizedAudioFilesMeta.length === 0) {
       return res.status(400).json({
         message: 'Please provide at least one valid audio link (MP3/MP4 or Google Drive link)'
       })
@@ -1393,6 +2131,7 @@ const submitAudio = async (req, res) => {
     version.audioStatus = 'audio_submitted'
     version.audioUrl = normalizedAudioUrls[0]
     version.audioFiles = normalizedAudioUrls
+    version.audioFilesMeta = stampMetadataForSave(normalizedAudioFilesMeta, req.user?._id)
     version.currentStage = 'audio_checking'
     version.isLocked = false
     version.lockedBy = null
@@ -1722,38 +2461,12 @@ const spocAudioApproval = async (req, res) => {
         console.error('Google Sheet logging failed for SPOC approval:', sheetError.message)
       }
 
-      // Send approved audio to admin publish queue.
+      // Send to admin publish queue via in-app notifications only.
       const admins = await User.find({
         role: 'admin',
         status: 'approved',
         isActive: true
       })
-
-      for (const admin of admins) {
-        await sendMail({
-          to: admin.email,
-          subject: `Audio Ready For Publish Approval â€” ${book.title} (${version.language})`,
-          html: `
-            <div style="font-family: Arial, sans-serif; max-width: 600px;">
-              <h2 style="color: #1D9E75;">Shantikunj Audiobooks LMS</h2>
-              <p>Pranam <strong>${admin.name}</strong>,</p>
-              <p>The audiobook has completed SPOC audio approval and is ready for admin publishing:</p>
-              <div style="background: #f5f5f5; padding: 16px; border-radius: 8px;">
-                <strong>Book:</strong> ${book.title}<br/>
-                <strong>Language:</strong> ${version.language}<br/>
-                <strong>Audio Status:</strong> ${version.audioStatus.replaceAll('_', ' ')}<br/>
-                <strong>Feedback Deadline:</strong> ${version.feedbackDeadline ? new Date(version.feedbackDeadline).toLocaleString() : 'Not set'}
-              </div>
-              <p>Please review and publish from the admin dashboard when ready.</p>
-              <a href="${FRONTEND_BASE_URL}"
-                 style="background: #1D9E75; color: white; padding: 12px 24px;
-                        text-decoration: none; border-radius: 6px; display: inline-block;">
-                Open Admin Dashboard
-              </a>
-            </div>
-          `
-        })
-      }
 
       await createBulkNotifications({
         userIds: admins.map((admin) => admin._id),
@@ -1784,7 +2497,7 @@ const spocAudioApproval = async (req, res) => {
       })
 
       return res.status(200).json({
-        message: `Audio approved and sent to admin publish queue (${admins.length} admins notified).`,
+        message: `Audio approved and sent to admin publish queue (${admins.length} admins notified in-app).`,
         version
       })
     }
@@ -1886,15 +2599,25 @@ const publishBook = async (req, res) => {
       return res.status(400).json({ message: 'Cannot publish while SPOC blocker is active' })
     }
 
-    const normalizedTextUrls = normalizeStoredUrls([
-      ...(Array.isArray(version.textFileUrls) ? version.textFileUrls : []),
-      version.textFileUrl
-    ])
+    const normalizedTextFilesMeta = normalizeFileMetadata({
+      metadata: version.textFilesMeta,
+      urls: [
+        ...(Array.isArray(version.textFileUrls) ? version.textFileUrls : []),
+        version.textFileUrl
+      ],
+      kind: 'document'
+    })
+    const normalizedTextUrls = normalizedTextFilesMeta.map((item) => item.url)
 
-    const normalizedAudioUrls = normalizeStoredUrls([
-      ...(Array.isArray(version.audioFiles) ? version.audioFiles : []),
-      version.audioUrl
-    ])
+    const normalizedAudioFilesMeta = normalizeFileMetadata({
+      metadata: version.audioFilesMeta,
+      urls: [
+        ...(Array.isArray(version.audioFiles) ? version.audioFiles : []),
+        version.audioUrl
+      ],
+      kind: 'audio'
+    })
+    const normalizedAudioUrls = normalizedAudioFilesMeta.map((item) => item.url)
 
     const hasTranslatedText = Boolean(String(version.translatedText || '').trim()) || normalizedTextUrls.length > 0
     if (!hasTranslatedText) {
@@ -1908,15 +2631,19 @@ const publishBook = async (req, res) => {
     // Ensure canonical asset fields remain populated.
     version.textFileUrl = normalizedTextUrls[0] || null
     version.textFileUrls = normalizedTextUrls
+    version.textFilesMeta = stampMetadataForSave(normalizedTextFilesMeta, version.assignedTranslator || req.user?._id)
     version.audioUrl = normalizedAudioUrls[0] || null
     version.audioFiles = normalizedAudioUrls
+    version.audioFilesMeta = stampMetadataForSave(normalizedAudioFilesMeta, version.assignedRecorder || req.user?._id)
 
     // Persist an immutable publish-time snapshot for final archived output.
     version.publishedTextFileUrl = normalizedTextUrls[0] || null
     version.publishedTextFileUrls = normalizedTextUrls
+    version.publishedTextFilesMeta = version.textFilesMeta
     version.publishedTranslatedText = String(version.translatedText || '').trim() || null
     version.publishedAudioUrl = normalizedAudioUrls[0] || null
     version.publishedAudioFiles = normalizedAudioUrls
+    version.publishedAudioFilesMeta = version.audioFilesMeta
     version.publishedAt = new Date()
     version.publishedBy = req.user._id
 
@@ -2041,7 +2768,7 @@ const updateTextStatus = async (req, res) => {
 const updateAudioStatus = async (req, res) => {
   try {
     const { bookId, versionId } = req.params
-    const { audioStatus, audioUrl, audioUrls, feedback } = req.body
+    const { audioStatus, audioUrl, audioUrls, audioFilesMeta, audioFiles, feedback } = req.body
 
     const book = await Book.findById(bookId)
     if (!book) return res.status(404).json({ message: 'Book not found' })
@@ -2050,10 +2777,17 @@ const updateAudioStatus = async (req, res) => {
     if (!version) return res.status(404).json({ message: 'Language version not found' })
 
     version.audioStatus = audioStatus
-    const normalizedAudioUrls = normalizeAudioUrls({ audioUrl, audioUrls })
+    const normalizedAudioFilesMeta = normalizeFileMetadata({
+      metadata: [...asArray(version.audioFilesMeta), ...asArray(audioFilesMeta), ...asArray(audioFiles)],
+      urls: normalizeAudioUrls({ audioUrl, audioUrls }),
+      kind: 'audio'
+    })
+    const normalizedAudioUrls = normalizedAudioFilesMeta.map((item) => item.url)
+
     if (normalizedAudioUrls.length > 0) {
       version.audioUrl = normalizedAudioUrls[0]
       version.audioFiles = normalizedAudioUrls
+      version.audioFilesMeta = stampMetadataForSave(normalizedAudioFilesMeta, req.user?._id)
     }
     if (feedback) version.feedback = feedback
     await book.save()
@@ -2332,6 +3066,7 @@ module.exports = {
   getAllBooks,
   getBookById,
   getTextAccessUrl,
+  getSourcePdfAccessUrl,
   uploadTranslationDocument,
   uploadAudioFile,
   assignUnclaimedVersion,

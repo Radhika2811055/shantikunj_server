@@ -19,10 +19,12 @@ const getArgValue = (name) => {
 const parseBookNumbers = (raw) => {
   if (!raw) return []
 
-  return raw
-    .split(',')
-    .map((item) => Number(String(item).trim()))
-    .filter((value) => Number.isInteger(value) && value > 0)
+  return [...new Set(
+    raw
+      .split(',')
+      .map((item) => String(item).trim())
+      .filter(Boolean)
+  )]
 }
 
 const buildNotificationFilter = (bookIds) => {
@@ -57,13 +59,21 @@ const run = async () => {
   const includeNotifications = hasFlag('--include-notifications')
   const rawBookNumbers = getArgValue('--bookNumbers')
   const targetBookNumbers = parseBookNumbers(rawBookNumbers)
+  const numericBookNumbers = targetBookNumbers
+    .map((value) => Number(value))
+    .filter((value) => Number.isInteger(value) && value > 0)
 
   if (!process.env.MONGO_URI) {
     throw new Error('MONGO_URI is missing in .env')
   }
 
   const bookFilter = targetBookNumbers.length > 0
-    ? { bookNumber: { $in: targetBookNumbers } }
+    ? {
+      $or: [
+        { bookNumber: { $in: targetBookNumbers } },
+        ...(numericBookNumbers.length > 0 ? [{ bookNumber: { $in: numericBookNumbers } }] : [])
+      ]
+    }
     : {}
 
   await mongoose.connect(process.env.MONGO_URI)

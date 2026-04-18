@@ -28,7 +28,9 @@ const createAuthPayload = (user) => ({
   name: user.name,
   email: user.email,
   role: user.role,
-  language: user.language
+  language: user.language,
+  approvedAt: user.approvedAt || null,
+  memberSince: user.approvedAt || user.createdAt || null
 })
 
 const createAuthToken = (user) => jwt.sign(
@@ -196,7 +198,9 @@ const googleCallback = async (req, res) => {
       name: user.name || '',
       email: user.email || '',
       role: user.role || 'pending',
-      language: user.language || ''
+      language: user.language || '',
+      approvedAt: user.approvedAt ? new Date(user.approvedAt).toISOString() : '',
+      memberSince: (user.approvedAt || user.createdAt) ? new Date(user.approvedAt || user.createdAt).toISOString() : ''
     })
 
     res.redirect(`${FRONTEND_BASE_URL}/auth/google/success?${params.toString()}`)
@@ -334,7 +338,9 @@ const getMyProfile = async (req, res) => {
       name: user.name,
       email: user.email,
       role: user.role,
-      language: user.language
+      language: user.language,
+      approvedAt: user.approvedAt || null,
+      memberSince: user.approvedAt || user.createdAt || null
     })
   } catch (error) {
     return res.status(500).json({ message: 'Server error', error: error.message })

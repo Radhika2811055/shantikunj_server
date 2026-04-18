@@ -26,6 +26,22 @@ const PORT = Number(process.env.PORT) || 5000
 
 const app = express()
 
+const handleFallbackAudioUpload = (req, res, next) => {
+  uploadAudioFileMiddleware.any()(req, res, (error) => {
+    if (!error) {
+      next()
+      return
+    }
+
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      res.status(400).json({ message: 'Each audio file must be 120MB or less.' })
+      return
+    }
+
+    res.status(400).json({ message: error.message || 'Invalid audio upload request.' })
+  })
+}
+
 if (IS_PRODUCTION) {
   // Needed when running behind reverse proxy/load balancer for secure cookies.
   app.set('trust proxy', 1)
@@ -62,6 +78,7 @@ app.use(cors({
 }))
 app.use(express.json())
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')))
+app.use('/data_source', express.static(path.join(__dirname, 'data_source')))
 
 // Routes
 
@@ -77,7 +94,7 @@ const bookRoutes = require('./routes/bookRoutes')
 app.use('/api/books', bookRoutes)
 
 // Fallback upload route to ensure recorder audio uploads are always reachable.
-app.post('/api/books/upload-audio-file', protect, authorise('recorder'), uploadAudioFileMiddleware.any(), uploadAudioFile)
+app.post('/api/books/upload-audio-file', protect, authorise('recorder'), handleFallbackAudioUpload, uploadAudioFile)
 
 const claimRoutes = require('./routes/claimRoutes')
 app.use('/api/claims', claimRoutes)

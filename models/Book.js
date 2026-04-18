@@ -1,5 +1,46 @@
 const mongoose = require('mongoose')
 
+const fileAssetSchema = new mongoose.Schema({
+  url: {
+    type: String,
+    required: true,
+    trim: true
+  },
+  fileName: {
+    type: String,
+    default: null
+  },
+  mimeType: {
+    type: String,
+    default: null
+  },
+  size: {
+    type: Number,
+    default: null
+  },
+  cloudinaryId: {
+    type: String,
+    default: null
+  },
+  resourceType: {
+    type: String,
+    default: null
+  },
+  format: {
+    type: String,
+    default: null
+  },
+  uploadedAt: {
+    type: Date,
+    default: null
+  },
+  uploadedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null
+  }
+}, { _id: false })
+
 const languageVersionSchema = new mongoose.Schema({
   language: {
     type: String,
@@ -144,6 +185,10 @@ const languageVersionSchema = new mongoose.Schema({
     type: [String],
     default: []
   },
+  audioFilesMeta: {
+    type: [fileAssetSchema],
+    default: []
+  },
   textFileUrl: {
     type: String,
     default: null
@@ -152,12 +197,20 @@ const languageVersionSchema = new mongoose.Schema({
     type: [String],
     default: []
   },
+  textFilesMeta: {
+    type: [fileAssetSchema],
+    default: []
+  },
   publishedTextFileUrl: {
     type: String,
     default: null
   },
   publishedTextFileUrls: {
     type: [String],
+    default: []
+  },
+  publishedTextFilesMeta: {
+    type: [fileAssetSchema],
     default: []
   },
   publishedTranslatedText: {
@@ -170,6 +223,10 @@ const languageVersionSchema = new mongoose.Schema({
   },
   publishedAudioFiles: {
     type: [String],
+    default: []
+  },
+  publishedAudioFilesMeta: {
+    type: [fileAssetSchema],
     default: []
   },
   publishedAt: {
@@ -228,8 +285,9 @@ const bookSchema = new mongoose.Schema({
     trim: true
   },
   bookNumber: {
-    type: Number,
+    type: String,
     required: true,
+    trim: true,
     unique: true          // 1 to 12
   },
   description: {
@@ -239,6 +297,14 @@ const bookSchema = new mongoose.Schema({
   originalPdfUrl: {
     type: String,
     default: null         // Hindi PDF stored here
+  },
+  originalPdfPublicId: {
+    type: String,
+    default: null
+  },
+  originalPdfMeta: {
+    type: fileAssetSchema,
+    default: null
   },
   languageVersions: [languageVersionSchema],
   status: {
